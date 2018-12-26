@@ -1,0 +1,350 @@
+---
+layout: post
+title:  "完善的崩溃&日志框架"
+date:   2018-09-30 11:23:32
+---
+
+# 开发
+
+### 目前工程使用的是RDM，有如下痛点
+
+- crash部分捕获不了，比如死锁,野指针,StackOverflow。
+- 会丢日志。日志只能取到iOS9以下，iOS10之后取不到日志。
+- 日志不能服务端拉取。
+- 没有crash handler。
+- 网络层错误等没有带上参数。没有区分是用户的问题:网络无连接。还是什么问题。导致错误无法定位。
+
+- 不支持微信
+- 没有办法定制，比如用户资金量数据。
+- crash 统计功能有bug。我需要能导出数据源。
+- 没有关于错误的统计。崩溃率计算。历史。
+- 非侵入性，耦合度高。(工程中验证)
+
+# 日志
+
+选择CocoaLumberJack的理由
+
+## 手Q对于丢日志
+
+当日志组件初始化之后，客户端会先取出mmap里面在手q上一次运行期间记录的日志与磁盘上保存的日志文件的最后一条日志的时间作对比，如果mmap里面记录的某条日志的时间比磁盘上保存的日志文件的最后一条日志的时间更晚说明此条日志是客户端日志文件丢失的日志，应当把此条日志记录回填到客户端日志文件。
+64k大小的mmap以环形循环复用的方式用来实时备份log。
+
+
+## 选择DB还是File,还是mmap?
+
+关键在于几点:1.flush同步是否影响读写 2.写入速度 3.实现难易，线程安全。
+
+目前的日志库是读取的consolelog，但是iOS9之后就获取不到了。单条数据大于 20K 时，直接写为文件速度会更快一些。
+手Q采用mmap文件内存映射。mmap 的缺陷：另外内存中的数据是定时 flush 到文件的，如果数据还未同步时程序挂掉，就会导致数据错误。mmap性能比较高。
+SQLite 数据库，单条数据小于20K更快。写入比文件系统快。 查询数据方便。 日志系统一般不用关系型db。 但是不便于追加写。单insert比较慢，大概在0.01s的量级。有了事务以后比较快。快了好几个数量级。如果参数比较多，比如级别，来源框架，等等，然后需要频繁查询或者过滤的话，sqlite比较方便。
+NSFileHandle: NSFileHandle用来拷贝大文件。连续读写性能也不错，在0.0001s左右。writeToFile:每一行追加写入。实际测试crash后不影响已经写入的文件(比较重要)。
+存在磁盘写满了无法写入的问题。
+暂不存在占用内存太多的问题。因为是逐条写入。
+
+## RQD
+
+RQD 里上传的是NSLog的consolelog。丢失日志原因在于iOS10之后苹果弃用了ASL，采用了新的log框架，导致FLEX等开源库都无法再获取到log。
+NSLog对性能影响很大。很多NSLog在主线程运行造成卡顿。而且NSLog可以被捕获，对安全有潜在影响。发布时应该使用宏禁止NSLog。
+
+NSLog会向ASL写log，同时向Terminal写log，而且同时会出现在Console.app中（Mac自带软件，用NSLog打出的log在其中全部可见）；不仅如此，每一次NSLog都会新建一个ASL client并向ASL守护进程发起连接，log之后再关闭连接。所以说，当这个过程出现N次时，消耗大量资源导致程序变慢也就不奇怪了。
+
+## Sentry日志框架SentryBreadcrumb
+比较弱.采用NSFileManager,整个文件写入。优点是有Sentry有GUI浏览很方便。
+
+选用CocoaLumberJack因为持续追加写入日志。在SentryReport转换为SentryEvent上报的时机，这个时机只可能是启动时，此时把读取到的日志追加上去。 一般是崩溃后的第二次启动。 如果没有崩溃，是人为创建的event，则event创建时就应该把日志塞进去。并且crash的时候也要在DDLog里记载，便于Log查询到crash的时间和之前的日志(之后可能会被塞入少量日志)。
+
+采用extra参数，但是sentry.io.extra参数是全局存储在userdefaults里的。 crash肯定会在启动的时候发送，一旦发出请求，不论是否返回都认为已经发送。(如果网络请求失败就丢弃)。
+
+data 以json格式上传，NSJSONSerialization 限制单个value 长度17K
+
+
+# iOS Crash 处理的困难
+
+困难在于App不能fork进程，所有的错误处理必须在当前已经崩溃的进程完成。当前已经崩溃的进程有如下问题：崩溃的线程已经停止执行了、内存可能已经被破坏了、数据结构可能已经变了、已经崩溃的线程可能还持有锁。
+
+### 线程安全
+
+如果崩溃的线程在崩溃之前持有锁，而crash-handler试图获取这个锁，那永远都获取不到，导致死锁。
+一个常见例子：因为crash-handler一般会暂停所有线程，如果当前任何一个线程持有pthread thread-list lock，并且crash-handler试图调用``pthread_getname_np``这个函数去获取线程名称，因为这个函数不是线程安全的，会在内部获取这个lock，就会死锁。
+
+```
+#import <pthread.h>
+
+static void unsafe_signal_handler (int signo) {
+    char name[512];
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    exit(1);
+}
+
+static void *enable_threading (void *ctx) {
+    return NULL;
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGSEGV, unsafe_signal_handler);
+
+    /* This is the actual code that triggers a reproducible deadlock; include this
+     * in your own app to test a different crash reporter's behavior.
+     *
+     * While this is a simple test case to reliably trigger a deadlock, it's not necessary
+     * to crash inside of a pthread call to trigger this bug. Any thread sitting inside of
+     * pthread() at the time a crash occurs would trigger the same deadlock. */
+    pthread_getname_np(pthread_self(), (char *)0x1, 1);     
+
+    return 0;
+}
+
+```
+
+第二个例子：利用已经被破坏的OC对象，给OC对象发送class消息，导致崩溃，并持有OC内部的锁。 然后crash-handler调用[NSThread callStackSymbols];就会导致死锁。
+
+```
+static void unsafe_signal_handler (int signo) {
+    /* Attempt to use ObjC to fetch a backtrace. Will trigger deadlock. */
+    [NSThread callStackSymbols];
+    exit(1);
+}
+
+int main(int argc, char *argv[]) {
+    /* Remove this line to test your own crash reporter */
+    signal(SIGSEGV, unsafe_signal_handler);
+
+    /* Some random data */
+    void *cache[] = {
+        NULL, NULL, NULL
+    };
+
+    void *displayStrings[6] = {
+        "This little piggy went to the market",
+        cache,
+	      "This little piggy had roast beef.",
+    };
+
+    /* A corrupted/under-retained/re-used piece of memory */
+    struct {
+        void *isa;
+    } corruptObj;
+    corruptObj.isa = displayStrings;
+
+    /* Message an invalid/corrupt object. This will deadlock crash reporters
+     * using Objective-C. */
+    [(id)&corruptObj class];
+
+    return 0;
+}
+
+```
+
+### 数据破坏
+
+很多crash-handler会在崩溃后会直接上报内容，发起一个high-level的网络请求，往往不是线程安全的。而且会重启runloop，重启runloop会导致app的代码继续执行，就可能会生成脏数据，比如内存已经释放了一半的数据，写入存储。
+
+### StackOverflow
+
+因为当前stack已经overflow了，所以无法打印出堆栈。
+
+# iOS Crash
+
+|Crash类型|举例实现|KSCrash捕获接口|Bugly能否捕获|
+| - | - | - | - |
+|NSException|数组越界、字典没有key等等| NSException | 能 |Exceptions
+|CPPException|C++ throw调用exption| CPPException | 能 |Exceptions
+|对空指针/错误指针解引用|*g_crasher_null_ptr|  mach|能  |SIGSEGV
+|StackOverflow|函数死循环调用|mach|无法捕获|SIGSEGV
+|除0|除0|mach|能|SIGABRT
+|illegal instruction|错误的指令，构造一个错误的函数指针并执行|mach|能|SIGILL
+|使用已经释放的对象(野指针)|unsafe_unretain内存修饰|Zombie|不一定|各种
+|CorruptMemory|堆空间被memset越界的操作破坏|mach|能|SIGSEGV
+|死锁|互相等待，在主线程lock两次，或者在当前线程gcd_sync|deadlock|否|线程安全
+|__builtin_trap|__builtin_trap函数调用|mach|能|SIGTRAP
+|abort()|abort|signal|能|SIGABRT
+|栈顶/底冲击|用汇编mov指令修改栈指针上面/下面的数据，会破坏当前栈的追踪/当前函数|不一定|不一定|SIGBUS
+|NXPage|调用函数指针，指针在不可执行的内存page里，比如NULL|mach|能|SIGSEGV|
+
+总结:Bugly没有捕获stackoverflow。 对于zombie的野指针和死锁也没有KSCrash处理得好。KSCrash可以灵活选择，在debug模式开启或者不开启zombie和watchdog。
+
+debug 是一个难题，因为连接电脑调试，debug-server会报错中止进程，无法走到crash-handler里。有一个办法是修改debug-server，debug-server通过 ``task_set_exception_ports``来捕获进程中的崩溃，因为有签名，所以修改debug-server工程量大。第二个办法是![这篇文章](https://zhuanlan.zhihu.com/p/33542591) 提到的通过 ``task_set_exception_ports``覆盖debug-server的处理，让它不捕获，然后再lldb里禁用signal。   但是实际上，因为DEBUG时如果开启信号捕获，则会卡死？。
+
+问题:捕获Mach异常或者Unix信号都可以抓到crash事件，这两种方式哪个更好呢？ EXC_BAD_ACCESS (SIGSEGV)表示的意思是：Mach层的EXC_BAD_ACCESS异常，在host层被转换成SIGSEGV信号投递到出错的线程。优选Mach异常，因为Mach异常处理会先于Unix信号处理发生，如果Mach异常的handler让程序exit了，那么Unix信号就永远不会到达这个进程了。  我们仍需要在进程中捕获SIGABRT，因为内核发送了一个EXC_CRASH的mach崩溃来生成SIGABRT，这种情况下如果捕获mach信号会导致进程死锁。所以我们在signal捕获SIGABRT，不注册EXC_CRASH。
+Bugly捕获的是signal，没有捕获mach，理论上会漏掉一些。(发送消息的过程中，没有找到接收进程的)
+
+### 从mach到signal，捕获Mach的机制原因
+
+Mach微内核中有几个基础概念：
+
+Tasks，拥有一组系统资源的对象，允许"thread"在其中执行。
+Threads，执行的基本单位，拥有task的上下文，并共享其资源。
+Ports，task之间通讯的一组受保护的消息队列；task可对任何port发送/接收数据。
+Message，有类型的数据对象集合，只可以发送到port。
+
+Mach exceptions: 允许在进程里或进程外处理，处理程序通过Mach RPC调用。
+POSIX signals: 只在进程中处理，处理程序总是在发生错误的线程上调用。
+
+![](https://upload-images.jianshu.io/upload_images/2833754-3846169f772536d4.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1000/format/webp)
+
+通用的Mach异常处理程序exception_triage()，负责将异常转换成Mach 消息。exception_triage()通过调用exception_deliver()尝试把异常投递到thread、task最后是host。首先尝试将异常抛给thread端口，然后尝试抛给task端口，最后再抛给host端口(默认端口)，如果没有一个端口返回KERN_SUCCESS，那么任务就会被终止。
+
+每一个thread、task及host自身都有一个异常端口数组，通过调用xxx_set_exception_ports()（xxx为thread、task或host）可以设置这些异常端口。
+各种行为都在host层被catch_[mach]_exception_xxx处理，64位的对应的是有mach函数(可在/bsd/uxkern/ux_exception.c查看)。
+这些函数通过调用ux_exception()将异常转换为对应的UNIX信号，并通过threadsignal()将信号投递到出错线程。
+
+在catch_mach_exception_raise里调用ux_exception将exception转成UNIX信号。
+
+要根据ipc_port_t拿到thread_t线程，依次调用convert_port_to_thread,get_bsdthread_info,proc_findthread 获取线程，如果进程存在且能获取到，调用ux_exception，这个函数负责把mach直接转换为signal。
+
+![](https://upload-images.jianshu.io/upload_images/2833754-009bdca3149d428a.png?imageMogr2/auto-orient/strip%7CimageView2/2/w/1000/format/webp)
+
+在catch_mach_exception_raise里，还有一个很重要的逻辑，就是stackoverflow本来应该在其它的栈里产生一个SIGSEGV信号。但是因为我们在栈顶有守护的page，所以导致我们拿到了KERN_PROTECTION_FAILURE(SIGBUS) ，所以我们需要手动把它改成KERN_INVALID_ADDRESS(SIGSEGV),然后会判断在进程或者线程是否能在alternate stack处理SIGSEGV，如果不行的化就设置为SIG_DFL信号，不做处理。
+
+为什么仅仅依靠NSSetUncaughtExceptionHandler() + signal() / sigaction()的方式无法捕捉到 stack overflow？因为signal只能在当前进程中处理，而mach而可以进程外处理。
+
+## KSCrash
+
+分为两部分，Recording 和 Reporting
+
+## Recording
+
+KSCrashDoctor: 判断crash是哪种类型的，比如死锁，比如math Error等等。
+数据文件的I/O保存和json修复。
+
+### Monitors
+
+分为多种:
+
+#### NSException
+NSSetUncaughtExceptionHandler()函数。有NSException* exception对象。
+调用[exception callStackReturnAddresses]堆栈。生成KSCrash_MonitorContext对象。給对象赋值。
+
+#### signal
+初始化分配一个sigaction结构体，然后调用sigaction()函数，设置结构体。
+
+#### Zombie
+替换dealloc方法。在dealloc的时候判断zombie是否存在。
+声明一个Zombie结构体，包括object和className,每次释放对象的时候都挂载这个对象和类，并且判断是否之前已经释放过。如果释放过就是这个类？好像不太好用。
+
+#### deadlock
+初始化一个线程，然后看主线程dispatch的代码是否有执行，如果很长一段时间没有执行说明主线程block了，在线程里abort()。默认5s后刷新一次，5秒检查。
+
+#### CPPException
+std::set_terminate 设置崩溃回调:cxxabiv1::_cxa_current_exception_type_ 获取到崩溃系信息。
+
+#### MachException
+
+用mach_port_allocate初始化一个mach port，然后mach_port_insert_right 增加adding的权力。然后task_set_exception_ports设为exception崩溃的handler
+
+### Tools
+
+## Reporting
+
+日志通过extra参数带上去，目前采用这种方案。日志数量可以控制。
+目前除去附加日志，一个崩溃文件json的大小在20k+。通过去掉部分无用数据(sentry的debugMeta字段)
+所以日志json包大小在25～100k的范围。
+gzip压缩json，有10个级别，目前采用zlib库默认，是6级似乎。6级之后压缩包大小区别不明显，性能变差。
+data文件能变小5.5～7倍。
+所以传输的数据在4~20k左右。跟Bugly每个包10k左右大概持平。
+
+# Crash Handler
+
+主要针对常见的NSExceptions，关键也在于同时要上报。
+
+实现的时候要注意，hook类的问题。
+比如NSArray,有NSArrayI 或 NSArray0 或 NSSingleObjectArrayI 和 NSPlaceholderArray 多种类型。
+
+有的类，比如NSObject，可以直接[NSObject class]。
+对于私有类，比如NSArrayI的，用``NSClassFromString``获取类。
+对于元类，比如NSArrayI的``arrayWithObjects:count:``,要用``object_getClass([NSObject class])``。
+
+# runtime类
+
+### unrecognizedSelector
+hook ``forwardingTargetForSelector:`` 或者 ``methodSignatureForSelector:`` 和``forwardInvocation:``。
+可以用代理或者其它对象实现转发，或者直接try...catch
+
+### NSNull
+
+hook ``forwardingTargetForSelector:`` 方法。因为发送过来的消息不确定。
+遍历@"", @(0), @[], @{} 几个基础类型，如果respondsToSelector，则使用这个空对象调用返回。
+
+# 配对类
+
+### KVO
+
+主要是防止重复添加，重复删除，忘记删除。
+在observeValueForKeyPath加上try..catch..
+
+创建一个proxy代理对象，把KVO添加和删除的方法hook到该对象上，并进行转发。
+还有一个方法是addObserver的时候记录已经添加的observer信息，并且判断，然后hook dealloc方法，一一移除。这样实现较复杂，而且无法判断是否真的有逻辑错误。
+
+### NSNotificationCenter
+
+类似KVO，更简单只需要处理释放。设置一个代理对象。observer释放的时候代理对象dealloc，把代理对象持有的noticenter都清空。
+
+### Timer
+
+也是类似KVO，用一个Proxy对象包装一下。Proxy对象持有真正的timer。
+
+# 容器类
+
+
+### NSArray/NSDictionary/NSCache/NSSet/NSOrderedSet/NSMutableXXX
+
+有两种实现方式，一种是绕过，比如判断数组是否越界，判断对象是否为空。
+第二种是try..catch。try catch如果不执行到catch对性能影响较小，如果每次都执行到catch，对性能有部分影响。try...catch 的好处是可以直接生成标准的NSException对象，方便我们进行错误管理。
+
+### NSString/NSAttributeString/NSMutableString
+
+同上
+
+### NSData/NSMutableData/NSUserDefaults
+
+同上
+
+# 其它
+
+### navigationcontroller push&push
+hook UINavigationController 的 ``pushViewController:animated:`` ，然后设置一个timer和一个interval，如果小于这个interval,就不push。
+也要加上pop。
+
+### UIKit API called from background thread
+
+hook setNeedsLayout setNeedsDisplay 等方法，判断是否在主队列执行，如果不在的话就dispatch到主队列。这个是否有性能影响？
+
+### wild pointer
+
+类似Zombie的实现，用一个全局数组保存需要zombie的类，hook dealloc方法，如果是已经需要的类，就zombie化。(这个方法并不好)。Zombie是一个性能损耗较大的操作。最好从底层实现?
+
+
+# 卡顿监控
+
+卡顿监控需要三个参数一起使用，包括FPS，CPU占用率，主线程Runloop监控。如果CPU占用率超过80%，主线程Runloop卡顿超过2s, FPS明显降低则表示卡顿。子线程每秒检查一次主线程状态。
+微信团队认为FPS的意义不大。FPS抖动比较严重，因为基于CADisplayLink实现的 FPS 无法完全检测出当前 Core Animation 的性能情况，它只能检测出当前 RunLoop 的帧率。
+还可以维护一个常驻线程去ping主线程。还可以通过hook objc_msgsend。损耗和精度成正比。
+
+MrPeak选择ping主线程的方法(signal注册回调，pthread_kill暂停主线程)。因为认为在子线程Runloop的监控无法打印出主线程当前的堆栈。(调用callStackSymbols确实不行)
+但是我不赞同，因为pingpong对app执行的影响，pthread_kill的影响都很大，会影响线上app的正常运行。违背一个监控组件的基本原则。我使用Runloop的方式，并且把优先级降低。同时引入了BSBacktraceLogger来打印主线程当前的堆栈。这个组件利用task_threads来获取当前所有的mach thread，然后根据thread_id找到需要打印的thread，再利用mach内核的api比如thread_get_state来获取当前堆栈的地址，并利用Mach-O相关的api对地址进行符号化。
+
+
+# 内存监控
+
+主要是FOOM，微信和FB都是利用排除法来定位FOOM，包括APP是否在升级，是否自动退出，是否崩溃，是否后台强杀，是否系统升级。排除后就是FOOM。微信采用dump内存中所有对象的方式，来定位问题。 常见问题包括UIGraphicsBeginImageContext和UIGraphicsEndImageContext必须成双出现，webView，autoreleasepool，循环强引用，大分辨率图片bitmap生成，大View绘制等等。dump操作占用内存20M，占用CPU13%
+
+手Q也是类似的方式。手Q fishhook了所有内存分配的函数，包括realloc,malloc,valloc,calloc,block_copy。因为性能问题，所以优化了backtrace_symbols，实现了更高效的堆栈回溯方法，优化后的方法在运行时只会获取堆栈函数的地址信息，在回写磁盘的时候再根据动态库的地址范围打印出函数名称。对于每个记录到的分配堆栈，首先通过md5算法将堆栈数据压缩为16字节的md5，通过md5值进行聚类，缓存中只保留16字节的md5数据，只有当某个堆栈的累计内存超过一定阀值时，才会保留原始堆栈信息。采用两种方式可以将堆栈降低到优化前的1/40左右，优化后的组件内存基本不会对App的内存造成太大影响。
+数据不直接写入磁盘，而是写入mmap，避免IO影响性能，当系统内存不足时再写入磁盘，保证爆内存后能拿到数据。
+
+这种dump内存的方式类似FBAllocationTracker，区别在于后者只支持OC对象。
+
+跟iOS版本和其它进程占用内存有关。根据统计，一般占用内存50～70%就会FOOM。FOOM之前会收到内存警告。
+
+对于内存来说，关键在于发现内存问题是什么对象引起的，什么对象占用内存太多。手Q定时dump内存的方式比较全面，但是太重了，而且对性能影响较大，而且hook了很多基础C函数，影响线上app的稳定性，不适合用于生产环境。  FBAllocationTracker 能记录所有的OC对象的创建数量/销毁数量/占用内存，单纯用于统计。所以我只是在每次收到内存警告的时候，读取FBAllocationTracker的统计数据，并且根据每个类占用内存的大小进行排序，上报占用内存最大的30个类，这样对性能影响微小，能够满足我们的需求，也不违反非侵入性原则。
+
+
+#### 内存泄漏监控
+
+手Q的方案是dump出内存中所有的地址，然后减去堆内存(malloc_get_all_zones)，栈内存(pthread_get_stackaddr_np)，寄存器内存(STRUCT_ARM_THREAD_STATE64)，全局内存区内存(dyld_get_image_header,data-common-bss段)，得出泄漏的。
+MLeaksFinder是通过hook ViewContronler对象的生命周期，退出页面释放3秒后检查是否释放，如果没有释放就调用FBRetainCycle来计算循环强引用，当然不总是有效。FBRetainCycle追踪强引用并构造一个图，采用DFS来遍历寻找循环强引用。
+
+内存泄漏不一定是因为循环强引用，比如没有release c对象或者c++对象。
+
+##### 野指针
+
+野指针普遍是采用Zombie或者类Zombie的实现来定位，因为无论如何会干预对象的正常释放，所以不适合在生产环境使用。

@@ -1,0 +1,327 @@
+---
+layout: post
+title:  "iOS内存知识复盘"
+date:   2018-07-27 11:23:32
+tags: iOS 学习 总结 内存 BUG DEBUG
+categories: iOS
+---
+
+# 基础知识
+
+## ARC
+
+编译器完成的。
+
+#### TaggedPointer
+64位操作系统，如果指针和变量都占用8字节，为了节省字节而且4字节也够用了，所以把指针指向的内容直接放在了指针变量的内存地址中。从引用计数可以看出，是一个释放不掉的单例常量对象。不是一个真正的对象，所以其没有isa。
+最高4位表示是NSNumber或者NSString, 最后一位(低位)用来存储number类型或者字符串长度，当存储用的数值超过56位存储上限的时候，那么NSNumber(NSString)才会用真正的64位内存地址存储数值，然后用指针指向该内存地址。NSString还会有一次压缩，所以不只是56位。
+字符串字面量必须在不同的操作系统版本下保持二进制兼容，而Tagged Pointer的内部细节是没有保证的，所以不是TaggedPointer。是NSCFStringConstant。
+
+引用计数的地方/dealloc的地方，都会有判断，如果是TaggedPointer直接返回。
+
+#### SUPPORT_NONPOINTER_ISA
+ARM 64位 的才支持。isa 的 struct 有如下定义:
+
+- indexed	0 表示普通的 isa 指针，1 表示使用优化，存储引用计数
+- has_assoc	表示该对象是否包含 associated object，如果没有，则析构时会更快
+- has_cxx_dtor	表示该对象是否有 C++ 或 ARC 的析构函数，如果没有，则析构时更快
+- shiftcls	类的指针
+- magic	固定值为 0xd2，用于在调试时分辨对象是否未完成初始化。
+- weakly_referenced	表示该对象是否有过 weak 对象，如果没有，则析构时更快
+- deallocating	表示该对象是否正在析构
+- has_sidetable_rc	表示该对象的引用计数值是否过大无法存储在 isa 指针
+- extra_rc	存储引用计数值减一后的结果
+
+#### 计数保存
+
+散列表来存储引用计数具体是用 DenseMap 类来实现.使用散列表保存引用计数的设计很好，即使出现故障导致对象的内存块损坏，只要引用计数表没有被破坏，依然可以顺藤摸瓜找到内存块的位置。键的类型为 DisguisedPtr<objc_object>.保存的值也是等于引用计数减一。
+
+SideTable 这个类，它用于管理引用计数表和 weak 表，并使用 spinlock_lock 自旋锁来防止操作表结构时可能的竞态条件。它用一个 64*128 大小的 uint8_t 静态数组作为 buffer 来保存所有的 SideTable 实例。并提供三个公有属性：
+```c
+spinlock_t lock;//保证原子操作的自选锁
+RefcountMap refcnts;//保存引用计数的散列表
+weak_table_t weak_table;//保存 weak 引用的全局散列表
+```
+
+weak 表的结构.使用一个全局的 weak 表来保存所有的 weak 引用。并将对象作为键，weak_entry_t 作为值。weak_entry_t 中保存了所有指向该对象的 weak 指针。
+
+#### retainCount
+
+- 如果是TaggedPointer返回this
+- 如果indexed，返回isa.extra_rc + 1
+- 如果has_sidetable_rc，返回isa.extra_rc + 1 + sidetable_rc
+- 如果不是indexed，先获取当前实例对应的 SideTable 对象，然后再获取 refcnts，用self作为key，查找，返回所有的值之和 +1
+
+对于已释放的对象以及不正确的对象地址，有时也返回 “1”。它所返回的引用计数只是某个给定时间点上的值，该方法并未考虑到系统稍后会把自动释放吃池清空，因而不会将后续的释放操作从返回值里减去。clang 会尽可能把 NSString 实现成单例对象，其引用计数会很大。如果使用了 TaggedPointer，NSNumber 的内容有可能就不再放到堆中，而是直接写在宽敞的64位栈指针值里。其看上去和真正的 NSNumber 对象一样，只是使用 TaggedPointer 优化了下，但其引用计数可能不准确。
+
+#### retain & release
+
+操作的过程类似retainCount，引用加一或者减一。
+
+sidetable_retain() 将 引用计数加一后返回对象，sidetable_release() 返回是否要执行 dealloc 方法。
+
+存储引用计数时总是真正的引用计数值减一。存储0代表是只有一个引用，随时会被释放。当release 0 的时候，不会出现负数，而是直接释放掉。
+
+```
+struct weak_table_t {
+    weak_entry_t *weak_entries;
+    size_t    num_entries;
+    uintptr_t mask;
+    uintptr_t max_hash_displacement;
+};
+```
+
+#### alloc new copy mutablecopy
+calloc() 函数相比于 malloc() 函数的优点是它将分配的内存区域初始化为0，相当于 malloc() 后再用 memset() 方法初始化一遍。
+
+在 retain 方法加符号断点会发现 alloc, new, copy, mutableCopy 这四个方法都会通过 Core Foundation 的 CFBasicHashAddValue() 函数来调用 retain 方法。
+
+new 就是alloc init。
+
+## 自动释放池
+
+在没有手加Autorelease Pool的情况下，Autorelease对象是在当前的runloop迭代结束时释放的，而它能够释放的原因是系统在每个runloop迭代中都加入了自动释放池Push和Pop
+```objc
+__weak id reference = nil;
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    NSString *str = [NSString stringWithFormat:@"sunnyxx"];
+    // str是一个autorelease对象，设置一个weak的引用来观察它
+    reference = str;
+}
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    NSLog(@"%@", reference); // Console: sunnyxx
+}
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    NSLog(@"%@", reference); // Console: (null)
+}
+```
+所以viewDidLoad和viewWillAppear是在同一个runloop调用的，而viewDidAppear不是的。
+枚举的enumsBlocks是有autoreleasePool的，
+自定义的 NSOperation 和 NSThread 需要手动创建自动释放池。比如： 自定义的 NSOperation 类中的 main 方法里就必须添加自动释放池。否则出了作用域后，自动释放对象会因为没有自动释放池去处理它，而造成内存泄露。但对于 blockOperation 和 invocationOperation 这种默认的Operation ，系统已经帮我们封装好了，不需要手动创建自动释放池。
+@autoreleasepool {} 是干预的。
+如果忘记在线程中创建pool，系统会提示并帮你创建一个pool。
+
+
+哪些地方使用了autorelease pool
+
+- 当使用alloc/new/copy/mutableCopy开始的方法进行初始化时，会生成并持有对象(也就是不需要pool管理，系统会自动的帮他在合适位- - 置release)。那么对于其他情况，比如``[NSMutableArray array];``就会autorelease。
+- 对于weak，以前是会autorealease保证使用过程不释放，现在改为先retain再release了。
+- id的指针或对象的指针在没有显式指定时会被附加上__autorealeasing修饰符
+- 如果UIViewController是new的，但是被pushViewController，那么就是在autorelease中释放。
+
+##### AutoreleasePoolPage
+AutoreleasePool并没有单独的结构，而是由若干个AutoreleasePoolPage以双向链表的形式组合而成（分别对应结构中的parent指针和child指针）
+AutoreleasePool是按线程一一对应的（结构中的thread指针指向当前线程）
+AutoreleasePoolPage每个对象会开辟4096字节内存（也就是虚拟内存一页的大小），除了上面的实例变量所占空间，剩下的空间全部用来储存autorelease对象的地址
+
+加入autorelease对象即将塞满（也就是next指针马上指向栈顶），这时就要建立下一页page对象，与这一页链表连接完成后，新page的next指针被初始化在栈底（begin的位置），然后继续向栈顶添加新对象。
+所以，向一个对象发送- autorelease消息，就是将这个对象加入到当前AutoreleasePoolPage的栈顶next指针指向的位置
+
+每当进行一次objc_autoreleasePoolPush调用时，runtime向当前的AutoreleasePoolPage中add进一个哨兵对象，值为0（也就是个nil）。
+objc_autoreleasePoolPush的返回值正是这个哨兵对象的地址，被objc_autoreleasePoolPop(哨兵对象)作为入参。
+在当前page中，将晚于哨兵对象插入的所有autorelease对象都发送一次- release消息，并向回移动next指针到正确位置。
+
+autoreleasePool 有 hot page。hot page是存在tls里的。
+
+#### Autorelease返回值的快速释放机制
+
+比如工厂模式，要autorelease/retain然后release调用。所以runtime有一套对autorelease返回值的优化策略。
+```objc
++ (instancetype)createSark {
+    id tmp = [self new];
+    return objc_autoreleaseReturnValue(tmp); // 代替我们调用autorelease
+}
+// caller
+id tmp = objc_retainAutoreleasedReturnValue([Sark createSark]) // 代替我们调用retain
+Sark *sark = tmp;
+objc_storeStrong(&sark, nil); // 相当于代替我们调用了release
+```
+
+
+###### Thread Local Storage
+TLS:将一块内存作为某个线程专有的存储，以key-value的形式进行读写
+在返回值身上调用objc_autoreleaseReturnValue方法时，runtime将这个返回值object储存在TLS中，然后直接返回这个object（不调用autorelease）；同时，在外部接收这个返回值的objc_retainAutoreleasedReturnValue里，发现TLS中正好存了这个对象，那么直接返回这个object（不调用retain）。
+
+方法是：tls_get_direct或者tls_set_direct。
+但假如被调方和主调方只有一边是ARC环境编译的该咋办？需要判断是否ARC，MRC就不做处理。
+
+###### __builtin_return_address
+
+作用是得到函数的返回地址，参数表示层数，如__builtin_return_address(0)表示当前函数体返回地址，传1是调用这个函数的外层函数的返回值地址，以此类推。如果一个函数返回前知道调用方是ARC还是非ARC，就有机会对于不同情况做不同的处理
+
+###### 反查汇编指令：callerAcceptsOptimizedReturn
+利用的入参就是函数返回地址。
+主调方在返回值之后是否紧接着调用了objc_retainAutoreleasedReturnValue或者objc_unsafeClaimAutoreleasedReturnValue。
+如果调用了就是ARC，可以继续执行。(mac OS 上)
+
+如果在arm64上，直接判断
+```objc
+static ALWAYS_INLINE bool
+callerAcceptsOptimizedReturn(const void *ra)
+{
+    // fd 03 1d aa    mov fp, fp
+    // arm64 instructions are well-aligned
+    if (*(uint32_t *)ra == 0xaa1d03fd) {
+        return true;
+    }
+    return false;
+}
+```
+
+## 内存修饰符
+
+#### assign(unsafe_unretained)
+
+ARC下，self既不是strong也不是weak，而是unsafe_unretained的
+
+#### strong
+
+objc_storeStrong里，如果旧的跟新的相等，直接返回。如果不等，则retain新的，再设值为新的，再释放旧的。
+
+#### weak
+
+Runtime维护了一个Weak表，用于存储指向某个对象的所有Weak指针。Weak表其实是一个哈希表，Key是所指对象的地址，Value是Weak指针的地址（这个地址的值是所指对象的地址）的数组。获取所以Weak指针地址的数组，然后遍历这个数组把其中的数据设为`nil`，最后把这个entry从Weak表中删除。  objc_initWeak/objc_storeWeak/clearDeallocating
+设为nil，可以防止野指针。（指针在对象释放完之后应该被设为NULL,不然会造成野指针，指向垃圾区无法操作，无法判空）。这是跟unsafe_unretained的区别。
+
+runtime对注册的类， 会进行布局，对于weak对象会放入一个hash表中。 用weak指向的对象内存地址作为key，当此对象的引用计数为0的时候会dealloc，假如weak指向的对象内存地址是a，那么就会以a为键， 在这个weak表中搜索，找到所有a为键的weak对象，从而设置为nil。
+
+当weak引用指向的对象被释放时，又是如何去处理weak指针的呢？
+调用objc_release,因为对象的引用计数为0，所以执行dealloc。
+在dealloc中，调用了_objc_rootDealloc函数在_objc_rootDealloc中最后调用objc_clear_deallocating,详细过程如下,从weak表中获取废弃对象的地址为键值的记录,将包含在记录中的所有附有 weak修饰符变量的地址，赋值为nil,将weak表中该记录删除,从引用计数表中删除废弃对象的地址为键值的记录。
+
+### dealloc
+
+1. 执行一个叫object_cxxDestruct,对所有的ivars执行objc_storeStrong(&ivar, null)
+2. 执行_object_remove_assocations去除和这个对象assocate的对象
+3. 执行objc_clear_deallocating，清空引用计数表并清除弱引用表，将所有weak引用指nil（这也就是weak变量能安全置空的所在）
+
+## block的内存管理
+
+
+
+是一个对象，结构体，有isa指向三个类，有函数指针指向block的代码块。
+
+编译器会根据block捕获的变量，生成具体的结构体定义。
+
+block内部的代码将会提取出来，成为一个单独的C函数。
+
+创建block时，实际就是在方法中声明一个struct，并且初始化该struct的成员。而执行block时，就是调用那个单独的C函数，并把该struct指针传递过去。
+
+block本身的内存管理：
+
+- \_NSConcreteStackBlock     栈上创建的block\(MRC下。ARC下创建时是\)  栈区block会在方法返回后将block空间回收； 使用copy将栈区block复制到堆区，可以长久保留block的空间。 大多数情况下，编译器会进行判断，自动将block从栈上复制到堆。(函数值返回或者传递block时)
+- \_NSConcreteMallocBlock  堆上创建的block\(ARC下赋值后\)  ,虽然引用计数取值都为1，但是retain和release是有用的。
+- \_NSConcreteGlobalBlock   作为全局变量的block \(在block内部没有引用任何外部变量,不能retain、copy、release\)。只用到全局变量、静态变量的block也是_NSConcreteGlobalBlock。 编译期就确定了
+是全局的block。使用retain,copy, release都无效，block依旧存在全局区，且没有释放, 使用copy和retain只是返回block的指针；
+
+_block 结构体里有个指针forwading指向自身。block从栈拷贝到堆上的时候,对应的栈上 block 的 _forwarding 成员会断开自环，而指向堆上的 block 对象,从而实现在堆和栈上都可以访问。
+
+#### block对自动变量的捕获规则：
+
+_NSConcreteStackBlock和_NSConcreteGlobalBlock是不持有对象的。_NSConcreteMallocBlock持有对象。
+
+```c
+int *static_k = _cself->static_k; // bound by copy，静态变量
+int val = _self->val; // bound by copy  ，栈变量
+```
+
+Block仅仅捕获了val的值，并没有捕获val的内存地址。所以在__main_block_func_0这个函数中即使我们重写这个自动变量val的值，依旧没法去改变Block外面自动变量val的值。自动变量是以值传递方式传递到Block的构造函数里面去的。Block只捕获Block中会用到的变量。由于只捕获了自动变量的值，并非内存地址，所以Block内部不能改变自动变量的值。
+
+静态全局变量，全局变量由于作用域的原因，于是可以直接在Block里面被改变。静态变量传递给Block是内存地址值，所以能在Block里面直接改变值。
+在Block中改变变量值有2种方式，一是传递内存地址指针到Block中，二是改变存储区方式(__block)。
+
+
+1.静态存储区的变量：例如全局变量、方法中的static变量  
+引用，可修改。
+
+2.block接受的参数  
+传值，可修改，和一般函数的参数相同。
+
+3.栈变量 \(被捕获的上下文变量\)    bound by copy
+捕获之后是**const**，不可修改。C中的自动变量只能在当前作用域。
+每次执行block时,捕获到的变量都是最初的值（编译期时确定的，值拷贝，只读拷贝）。
+
+4.栈变量 \(有\_\_block前缀\)    bound by ref
+引用，可以修改。是结构体对象，拷贝的是指向该结构体对象的指针。结构体类型，以对象方式处理。
+用 static 声明也会变成指针，但是在 block 截获变量后，原来的自动变量已经废弃，因此block 中超过变量作用域从而无法通过指针访问原来的自动变量。
+
+5.对象变量
+ARC环境下，Block捕获外部对象变量，是都会copy一下指针的，指向的对象都是一样的。只不过带有_block修饰符的变量会被捕获到Block内部持有。只有带_block修饰符会生成结构体。 不带_block的话就是id。 但是两个都会放在block的结构体里。
+
+```
+__Block_byref_block_obj_0 *block_obj = __cself->block_obj; // bound by ref
+id obj = __cself->obj; // bound by copy
+```
+
+
+####  __block修饰符
+
+
+对于id类型对象，也需要_block._block对象有copy方法和dispose方法来处理生命周期。
+
+修饰后的对象，在block中调用是i->__forwarding->i。
+
+_block的变量也被转化成了一个结构体__Block_byref_i_0,这个结构体有5个成员变量。第一个是isa指针，第二个是指向自身类型的_forwarding指针。_forwarding指针这里的作用就是针对堆的Block，把原来_forwarding指针指向自己，换成指向_NSConcreteMallocBlock上复制之后的_block自己。然后堆上的变量的_forwarding再指向自己。这样不管_block怎么复制到堆上，还是在栈上，都可以通过(i->_forwarding->i)来访问到变量值。
+
+#### block循环强引用
+
+在MRC环境下，__block根本不会对指针所指向的对象执行copy操作，而只是把指针进行的复制。(所以可以解除循环强引用)
+
+ARC下不论是否_block,只要上下文变量持有block(如self)就会强引用。
+可以在block中执行设置对象=nil来释放，解除强引用。（id类型则必须手动处理其内存管理。)
+也可以用_weak来解除。
+
+NSOperation不会循环强引用，内部是queue操作的
+
+#### strong-weak Dance
+
+block 只会捕获外部变量，内部变量的当然没问题会被释放。
+_strong 声明只在block运行的时候才生效，能解决block运行到一半self被释放的问题，所以解决不了block开始前被释放的问题。
+GCD 等等情况不会造成循环强引用。
+如果只是在方法内部声明block并调用，或者block作为参数传入其它对象的方法并且在方法内部调用，是不会造成循环强引用的。block只有在作为property并且声明为strong的时候才会循环强引用。局部变量没有ARC的内存管理等等。退出作用域后直接sidetable_release。
+双层block调用。比如sendRequest里再sendRequest。第二个block里如果是stronglify了，就需要weaklify。如果weakself变量还在，可以省掉一次strongSelf。直接在第二个block里stongSelf=weakSelf就好了。
+
+
+
+
+# 遇到的问题
+
+OC的常见问题
+
+## 内存泄漏
+
+循环强引用。
+
+#### FBRetainCycleDetector
+原理完全是基于 DFS 算法：把整个对象的之间的引用情况当做图进行处理，查找其中的环，就找到了循环引用
+
+#### MLeaksFinder
+MLeaksFinder一开始从UIViewController入手。我们知道，当一个UIViewController被pop或dismiss后，该UIViewController包括它的视图，视图的子视图等等将很快被释放（除非你把它设计成单例，或者持有它的强引用，但一般很少这样做）。在是，我们只需在一个ViewController被弹出或关闭一小段时间后，看看该UIViewController，它的视图，视图的子视图等等是否还存在。
+
+具体的方法是，为基类NSObject添加一个方法-willDealloc方法，该方法的作用是，先用一个弱指针指向self，并在一小段时间（3秒）后，通过这个弱指针调用-assertNotDealloc， -assertNotDealloc主要作用是直接中断言。这样，当我们认为某个对象应该被释放了，在释放前调用这个方法，如果3秒后它被释放成功，weakSelf就指向nil，不会调用到-assertNotDealloc方法，也就不会中断言，如果它没被释放（泄露了）， - assertNotDealloc就会被调用中断言。这样，当一个UIViewController被弹出或关闭时（我们认为它应该要被释放了），我们遍历该UIViewController上的所有视图，依次调-willDealloc，若3秒后没被释放，就会中断言。
+
+#### Memeroy Graph
+
+## 野指针
+
+略
+
+## overflow/underflow
+
+##
+
+Asan?
+
+野指针监控。内存泄漏监控。overflow/underflow监控 等等Asan相关。从汇编，到C，到C++，到Java，到OC的内存管理。内存监控。crash处理，crash debug等等。(7~8月),LLDB,Hooper反编译搜索。内存修饰符的实现和管理。ARC的实现和内存管理。自动释放池的实现和内存管理。block的实现和内存管理。objc_msgSend在ARM的寄存器分析。
+
+## iOS 内存分配
+
+![](https://github.com/Damonvvong/DevNotes/raw/master/images/framework2-memory.png)
+
+- 栈区中的变量不需要程序员管理
+- 堆区的需要程序员管理
+- 在 iOS 中堆区的内存是所有应用程序共享
+- 系统使用表级别结构来分配内存空间，所以逻辑地址和物理地址可能不一样

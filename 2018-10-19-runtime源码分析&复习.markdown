@@ -1,0 +1,190 @@
+---
+layout: post
+title:  "runtime源码分析&复习"
+date:   2018-09-30 11:23:32
+tags: iOS 学习 总结 逆向
+categories: iOS
+---
+
+# Messages
+
+
+objc_msgSend/objc_msgSendSuper
+**...stret/...fpret/** :返回值的不同
+
+
+**id _Nullable method_invoke(id _Nullable receiver, Method _Nonnull m, ...)** :调用OC的方法，比method_getImplementation更快
+
+
+objc_msgSendv(id _Nullable self, SEL _Nonnull op, size_t arg_size,
+              marg_list _Nonnull arg_frame)
+
+void _objc_msgForward(void /* id receiver, SEL sel, ... */ )
+
+#### objc_msgsend的汇编代码解读
+
+ARM64架构的处理器有31个64bit的整数寄存器，分别被标记为x0 - x30。每一个寄存器也可以分离开来只使用低32bit，标记为w0 - w30。其中x0 - x7是用来传递函数的参数的。这意味着objc_msgSend接收的self参数放在x0上，_cmd参数放在x1上。
+
+获取传入对象的类
+获取类的方法缓存
+通过selector在缓存中寻找方法
+如果没有命中缓存，调用C实现的代码来继续查寻
+命中缓存则跳到方法对应的IMP
+
+
+```objc
+//汇编写的,一是效率高，二是参数和返回值不确定在哪， 汇编找到 IMP 地址后参数都在栈
+id objc_msgSend(id self, SEL _cmd, ...) {
+	NilTest	NORMAL
+	GetIsaFast NORMAL		// r11 = self->isa
+	CacheLookup NORMAL		// calls IMP on success
+	MethodTableLookup // -> 实际调用 _class_lookupMethodAndLoadCache3 -> 实际调用 lookUpImpOrForward
+}
+
+lookUpImpOrForward(cls, sel, obj,
+                              YES/*initialize*/, NO/*cache*/, YES/*resolver*/);
+}
+
+```
+
+
+## 其它的动态性
+
+#### libffi 如何动态调用C函数
+
+``dlsym`` 可以调用C函数，但是函数指针不通用，必须定义函数指针的入参和出参。函数的参数既可以使用栈传递，也可以使用寄存器传递。Calling Convention规定了参数的传递的顺序和方式，以及栈的维护方式。
+所以在C语言的层面解决不了这个问题。
+
+``objc_msgSend``是用汇编写的，在调用这个函数之前，会把栈/寄存器等数据都准备好，相当于调用前对参数入栈等处理由这个函数自己写的汇编代码接管了，不需要编译器在调用处去生成这些指令。
+
+这里会在调用真正的函数之前，根据 Calling Convention 准备好栈帧/寄存器数据和状态，最后再 jump/call 到函数实体执行就可以了，这时函数实体按约定去取参数是取得到的，可以正常执行。于是 objc 就做到了在编译前只需要定义一个简单的 objc_msgSend，就支持运行时动态调用任意类型的 C 函数（所有 OC 方法的 IMP）。
+
+libffi 里动态调用c函数的流程:
+
+- 通过 dlsym 拿到函数指针。
+- 给每个参数申请内存空间，按 ffi 要求把参数数据组装成数组。（用alloca()申请空间，不需要free()去释放）
+- 用函数参数个数/参数类型/返回值类型组装成 cif 对象，表示这个函数原型。（有点像OC的methodSignature）
+- 申请内存空间用于保存函数返回值。
+- 把 cif 函数原型，函数指针，返回值内存指针，参数数据 传入 ``ffi_call``调用这个函数。
+
+``ffi_call``底层是用汇编实现的，它在调用我们传入的函数之前，会根据上面提到的函数原型 cif 和参数数据，把参数都按规则塞到栈/寄存器里，准备好数据和状态，这样调用的函数实体里就可以按规则取到这些参数，正常执行了。调用完再获取返回值，清理这些栈帧/寄存器数据。
+
+##### 利用libffi定义自己的block
+
+- 准备一个函数实体 JPBlockInterpreter。
+- 根据函数参数个数/参数类型/返回值类型组装成 cif 对象，表示这个函数原型。
+- 准备一个函数指针 blockImp ，用于调用。
+- 通过 ffi_closure 把 函数原型_cifPtr / 函数实体JPBlockInterpreter / 上下文对象self / 函数指针blockImp 关联起来。
+
+上述例子中，这一系列处理后 blockImp 就可以当成一个指向返回值类型是void，参数类型是 (int a, NSString *b) 的函数去调用，调用后会去到 JPBlockInterpreter 这个函数实体，在这个函数里面可以通过 args 提取传进来的参数，通过userdata 取上下文进行处理。这里可以根据参数类型的不同动态创建不同的 cif 对象，生成不同的 blockImp 函数指针。
+
+
+
+# NSObject
+
+## ARC
+
+为什么引用计数？Cpp11也是引用计数。
+
+引用计数的优点是可预测可控制，跟堆的大小无关。三个缺点是有计数的性能损耗，有循环引用，加减有多线程竞争。第一个缺点ARC有优化，第二个缺点有弱引用，第三个缺点用分离锁解决。
+
+GC是有一张图，根部对象，没有被引用到的都会被回收。
+
+GC优点是没有引用计数的计算性能损耗，三个缺点是释放无法预测(不知道什么时候回收)，在回收的时候线程必须要暂停一会儿，记录的性能损耗跟堆大小有关，堆越大损耗越大。  第二个缺点可以用程序来解决，第三个缺点现在不是问题。
+
+OC不使用GC,而Java采用GC，原因还是在于OC是用malloc来创建对象的，会开辟内存。Java只是创建了一个指针。C都倾向于由开发者管理内存，而Java倾向于由JVM来管理内存。
+
+##### 引用计数的数据结构
+
+问题：如果对全局变量sideTables加锁，会持有锁的时间太长。为了降低锁竞争，就使用分离锁。
+SideTables是StripedMap<SideTable>,StripedMap是模版类，要求每个对象都有一个自旋锁。
+这就是分离锁的设计。分离锁是对于太频繁使用的锁的设计。这个map的key是指针的地址，所以有hash算法indexForPointer。内部是一个数组[]。
+
+SideTable包含一个自旋锁，一个引用计数器 RefcountMap refcnts和weak_table 弱引用表。RefcountMap是一个DenseMap，key是OC对象的指针，value是整型。
+
+RefcountMap的value就是引用技术，但是利用了bit_mask技术。从左到右依次是:
+PINNED/REAL_COUNT/DEALLOCATING/WEAKLY_REFERENCED
+是否达到位数上限/实际引用数量/是否正dealloc/是否弱引用
+
+weak_table里包括一个weak_entry的数组(指针)，以及数组的个数。weak_entry里存储了这个referrers是所有指向这个对象的指针。
+
+对象创建后的retainCount 是 1 + SIDE_TABLE_RC_SHIFT
+##### retain
+
+就是引用计数加一，SIDE_TABLE_RC_ONE
+
+##### release
+
+先在引用计数表中找是否存在，如果不存在就dealloc。如果小于SIDE_TABLE_DEALLOCATING，也dealloc。
+然后减去一个SIDE_TABLE_RC_ONE。
+最后看是否需要dealloc。
+
+##### alloc
+
+以前是调用malloc_zone_calloc，现在没有zone了，就是直接调用calloc，malloc是从堆中开辟内存。calloc区别在于会将所分配的内存空间中的每一位都初始化为零。
+然后初始化isa指针，指向class。
+
+
+##### dealloc
+
+object_dispose里调用了两个函数，一个是objc_destructInstance，一个是free(obj)
+
+objc_destructInstance 里，先后调用c++ destructors，移除关联对象，清除weak
+
+关联对象会存在一张映射表中，根据传入的object找到关联对象映射表，遍历映射表添加到vector中，然后最后清楚相关数据，最后的时候遍历vector，release关联对象。
+
+清除weak引用，取散列表SideTable，遍历是否有weak引用，SIDE_TABLE_WEAKLY_REFERENCED作用就是标示是否有weak引用。如果有就调用weak_clear_no_lock这个函数，这个函数中会遍历清除所有weak引用
+
+##### autorelease
+
+就是把对象加到AutoreleasePoolPage，如果page满了要新建一个page
+
+##### autoreleasepool
+
+viewDidLoad和viewWillAppear是在同一个作用域调用，但是viewDidAppear不是。 作用域结束的时候使里面的对象引用计数-1。
+
+autoreleasepool是由若干个AutoreleasePoolPage以双向链表的形式组合，没有单独的结构。按线程一一对应(每个线程都有pool)。AutoreleasePoolPage创建时有一页虚拟内存大小的内存，除了上面的实例变量所占空间，剩下的空间全部用来储存autorelease对象的地址。
+```c
+magic_t const magic;
+id *next;
+pthread_t const thread;
+AutoreleasePoolPage * const parent;
+AutoreleasePoolPage *child;
+uint32_t const depth;
+uint32_t hiwat;
+```
+在@autoreleasepool block 进入的时候调用push，退出的时候调用pop。push会在next的位置插入一个哨兵POOL_SENTINEL。pop的时候会把push 和pop之间所有的对象都调用一次release。
+
+每个 event loop 开始前，系统会自动创建一个 autoreleasepool ，并在 event loop 结束时 drain 。我们上面提到的场景 1 中创建的 autoreleased 对象就是被系统添加到了这个自动创建的 autoreleasepool 中，并在这个 autoreleasepool 被 drain 时得到释放。
+
+######  ARC tricks
+
+Thread Local Storage:对返回值调用objc_autoreleaseReturnValue方法时，runtime将这个返回值object储存在TLS中，然后直接返回这个object（不调用autorelease）；同时，在外部接收这个返回值的objc_retainAutoreleasedReturnValue里，发现TLS中正好存了这个对象，那么直接返回这个object（不调用retain）。 tls_get_direct/tls_set_direct
+
+__builtin_return_address + 反查汇编指令。 __builtin_return_address可以知道函数返回值的地址，获取到地址后再查汇编指令，可以知道主调方在返回值之后是否紧接着调用了objc_retainAutoreleasedReturnValue，如果是，就知道了外部是ARC环境，反之就走没被优化的老逻辑。
+
+###### 哪些对象会被加入到自动释放池？
+调用了objc_autorelease函数的时候。比如objc_loadWeak,objc_autoreleaseReturnValue 两个函数。或者被__autoreleasing修饰符修饰的。
+
+实际情况是:
+- weak对象在某些版本使用的时候会autorelease，有些版本是直接release。
+- objc_autoreleaseReturnValue作为函数的返回值，内部创建了对象，但是又没有走TLS的时候，会autorelease。即除了alloc/new/copy/mutableCop之外的对象。
+- 类似NSError **这种传递指针的的时候会加上__autorealeasing
+
+有 四个
+- objc_autoreleaseReturnValue: 如果两边都是ARC,尝试TLS，autorelease操作可能跳过。
+- objc_retainAutoreleaseReturnValue: 如果两边都是ARC，autorelease+retain操作可能跳过，不会TLS。比如new,copy,alloc,mutaCopy
+- objc_retainAutoreleasedReturnValue: 如果两边都是ARC,尝试TLS，对返回值retain操作。跟1配对
+- objc_unsafeClaimAutoreleasedReturnValue: 如果两边都是ARC，操作可能跳过对返回值release操作，不会TLS。跟2配对。
+
+##### __strong
+
+objc_storeStrong:objc_retain新值,objc_release旧值
+objc_autoreleaseReturnValue: 是否TLS，否则返回objc_autorelease
+objc_retainAutoreleasedReturnValue : 是否TLS,否则返回objc_retain
+
+##### __weak
+
+objc_storeWeak: 把旧的对象在weak表找到entry移除，在weak表注册新的对象的entry
+
+## taggerPoint

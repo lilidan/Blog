@@ -1,0 +1,282 @@
+---
+layout: post
+title:  "让别人的小程序运行在自己的app中"
+date:   2018-08-10 11:23:32
+tags: iOS 学习 总结 逆向
+categories: iOS
+---
+
+
+# 概述
+
+在工作中难免还是会遇到需要逆向的时候，比如想看看别人家某个功能是用什么黑魔法实现的，比如提出了实现微信XXX的需求。
+
+### iOS逆向的分类
+
+- 网络分析:通过分析和篡改接口数据，可以有效的破解通过接口数据来控制客户端行为的app，常用的抓包工具有Tcpdump, WireShark, Charles等，windows平台有fidller
+
+- 静态分析:通过砸壳、反汇编、classdump头文件等技术来分析app行为，通过这种方式可以有效的分析出app实用的一些第三方库，甚至分析出app的架构等内容，常用的工具有dumpdecrypted（砸壳）、hopper disassembler（反汇编）、class_dump（导头文件）
+
+- 动态分析:动态分析指的是通过分析app的运行时数据，来定位注入点或者获取关键数据，常用的工具有cycript（运行时控制台）、 lldb+debugserver（远程断点调试）、logify（追踪）
+
+
+### iOS 逆向的工作流程
+
+- 砸壳
+- class-dump
+- 分析功能界面
+- 反汇编
+- 写hook
+- 打包动态库,注入动态库
+- APP重签名
+
+# 砸壳
+
+主要有dumpdecrypted和Clutch
+
+### dumpdecrypted
+
+__attribute__((constructor))修饰函数，理论上是在main函数之前，加载image之后.
+``_dyld_register_func_for_add_image``在加载image的时候执行。入参是mach_header结构体和path路径。
+
+定义宏 ``#define swap32(value) (((value & 0xFF000000) >> 24) | ((value & 0x00FF0000) >> 8) | ((value & 0x0000FF00) << 8) | ((value & 0x000000FF) << 24) )`` 用来把数字从小端序转成大端序。
+因为fat_header里的cpu_type等判断需要swap32. mach_header的相关判断不需要。
+
+先从传入的镜像路径中，获取镜像文件名。然后通过文件头(mach_header->magic)判断二进制文件架构是不是64位。
+通过``lc = (struct load_command *)((unsigned char *)mh + sizeof(struct mach_header))``;获取到load_command指针，因为load_command总在mach_header后面
+通过遍历``mach_header->ncmds``，就是所有的LoadComand，如``load_command->cmd``等于LC_ENCRYPTION_INFO，是加密的，则进行解密，不然跳过。如果是加密的，强转load_command成encryption_info_command。
+然后根据encryption_info_command->cryptid == 1 判断是否加密。在我们完成解密后还要把这里置为0。
+这里拿到encryption_info_command->cryptoff是加密部分的起始点。
+然后根据path的拷贝，如果镜像是 FAT Binary，拿到fat_header,根据fat_header拿到fat_mach。遍历fat_mach,循环遍历每一个 fat_arch，如果找到一个 fat_arch 中 cputype 和 subcputype 与传入的 mach_header(mh) 一致，则表明找到了当前加载镜像在 FAT Binary 中的位置。
+分三部分写入。然后把文件指针设置到文件开头，写入 FAT Binary 的前 n 字节。接着把已解密的部分写入到文件中。最后把剩下的部分（其他架构的镜像）写入到文件中。
+
+### Clutch
+
+Clutch是通过posix_spawnp创建一个进程，然后暂停进程，dump内存。Clutch容易出错，建议使用dumpcrypted。
+
+# class-dump
+
+主要流程是读取和解析mach-O文件的数据。先加载符号表，然后分别解析协议表、类列表、分类列表。原理类似Mach-O-View,通过offset偏移找到对应的字符串，拿到名称。
+
+### Mach-O 文件结构
+
+- Fat Header: 胖header，有Magic Number,Number of Arch(每个arch都有 CPU Type,SPU Subtype 等等信息,对应每个可执行文件)
+
+- Excutable: 分为Mach-header,Load Command(定义LC_SEGMENT，有命令LC_LOAD_DYLIB/LC_LOAD_WEAK_DYLIB),Section(_TEXT),Section(_DATA)
+
+Mach-header:
+- Magic Number :表示支持设备的CPU位数
+- cputype和 cpusubtype: CPU类型和子类型
+- filetype : Mach-O文件类型
+- ncmds 和 sizeofcmds: 用于加载器的 加载命令的条数和大小
+- flags : 动态链接器dyld的标志
+
+Load Command 定义了多种类型的 LC_SEGMENT:
+- __PAGEZERO: 空指针陷阱段
+- __TEXT: 程序代码段
+- __RODATA: read only程序只读数据段
+- __LINKEDIT: 链接器使用段
+
+每一种LC_SEGMENT定义有字段:
+
+- Segment Name: 该Segment的名称, 用于load_segment
+- VM Address: 该段的虚拟物理地址
+- VM Size: 该段所需要分配的虚拟内存大小(字节)
+- File Offset: 该段在文件中的偏移量
+- File Size: 该段在文件中占据的字节数
+- Maximum VM Protection: 段的页面所需要的最高内存保护
+- Initial VM Protection: 段页面初始化的内存保护
+- Number of Sections: 段中section区的数量
+
+Section包括:
+- _text: 主程序代码
+- _stubs, _stub_helper: 用于动态链接的桩
+- _cstring: 程序中c语言字符串
+- _const: 常量
+- _TEXT,_objc_methname: OC方法名称
+- _TEXT,_objc_methntype: OC方法类型
+- _TEXT,_objc_classname: OC类名
+- _DATA,_objc_classlist: OC类列表
+- _DATA,_objc_protollist: OC原型列表
+- _DATA,_objc_imageinfo: OC镜像信息
+- _DATA,_objc_const: OC常量
+- _DATA,_objc_selfrefs: OC类自引用(self)
+- _DATA,_objc_superrefs: OC类超类引用(super)
+- _DATA,_objc_protolrefs: OC原型引用
+- _DATA, _bss: 没有初始化和初始化为0 的全局变量
+
+
+# 动态分析
+
+都是注入动态库，可以拿到变量信息/页面信息。
+动态调试经常用到事件响应链。 第一步是先寻找事件接受者，是从UIApplication的keywindow开始，一直到子view，通过``hittest:withEvent``方法。而响应的时候是通过 ``nextReponder:``,是从子view一路到UIWindow再到UIApplication。
+
+### Reveal
+
+方便查看页面。原理类似Cycript
+
+### Cycript
+
+javascript调试，原理是使用JSCore和libffi实现。
+很类似JSPatch对C函数的实现。
+
+#### libffi 如何动态调用C函数
+
+``dlsym`` 可以调用C函数，但是函数指针不通用，必须定义函数指针的入参和出参。函数的参数既可以使用栈传递，也可以使用寄存器传递。Calling Convention规定了参数的传递的顺序和方式，以及栈的维护方式。
+所以在C语言的层面解决不了这个问题。
+
+``objc_msgSend``是用汇编写的，在调用这个函数之前，会把栈/寄存器等数据都准备好，相当于调用前对参数入栈等处理由这个函数自己写的汇编代码接管了，不需要编译器在调用处去生成这些指令。
+
+这里会在调用真正的函数之前，根据 Calling Convention 准备好栈帧/寄存器数据和状态，最后再 jump/call 到函数实体执行就可以了，这时函数实体按约定去取参数是取得到的，可以正常执行。于是 objc 就做到了在编译前只需要定义一个简单的 objc_msgSend，就支持运行时动态调用任意类型的 C 函数（所有 OC 方法的 IMP）。
+
+libffi 里动态调用c函数的流程:
+
+- 通过 dlsym 拿到函数指针。
+- 给每个参数申请内存空间，按 ffi 要求把参数数据组装成数组。（用alloca()申请空间，不需要free()去释放）
+- 用函数参数个数/参数类型/返回值类型组装成 cif 对象，表示这个函数原型。（有点像OC的methodSignature）
+- 申请内存空间用于保存函数返回值。
+- 把 cif 函数原型，函数指针，返回值内存指针，参数数据 传入 ``ffi_call``调用这个函数。
+
+``ffi_call``底层是用汇编实现的，它在调用我们传入的函数之前，会根据上面提到的函数原型 cif 和参数数据，把参数都按规则塞到栈/寄存器里，准备好数据和状态，这样调用的函数实体里就可以按规则取到这些参数，正常执行了。调用完再获取返回值，清理这些栈帧/寄存器数据。
+
+##### 利用libffi定义自己的block
+
+- 准备一个函数实体 JPBlockInterpreter。
+- 根据函数参数个数/参数类型/返回值类型组装成 cif 对象，表示这个函数原型。
+- 准备一个函数指针 blockImp ，用于调用。
+- 通过 ffi_closure 把 函数原型_cifPtr / 函数实体JPBlockInterpreter / 上下文对象self / 函数指针blockImp 关联起来。
+
+上述例子中，这一系列处理后 blockImp 就可以当成一个指向返回值类型是void，参数类型是 (int a, NSString *b) 的函数去调用，调用后会去到 JPBlockInterpreter 这个函数实体，在这个函数里面可以通过 args 提取传进来的参数，通过userdata 取上下文进行处理。这里可以根据参数类型的不同动态创建不同的 cif 对象，生成不同的 blockImp 函数指针。
+
+### LLDB
+
+砸壳之后，可以用LLDB甚至Xcode来调试，加上重签名的脚本即可。可以使用MallocStackLogging和Debug Memory Graph等功能。memory graph可以查看内存的引用关系。
+
+# 反汇编
+
+IDA / Hooper
+
+IDA 更强大。生成伪代码更易读。可以根据block的函数指针直接跳转到对应的伪代码位置。可以全文搜索字符串
+
+Hooper 和IDA都有的功能，包括修改汇编语句,跳转内存地址。
+
+
+# Hook
+
+分为CaptainHook和C的FishHook
+
+## CaptainHook
+
+原理就是method Swizzling。
+
+区别在于__attribute__((constructor)), 在类+load方法执行完之后，main函数执行完之前调用。destructor在main函数之后，然后类析构，然后再调用。__attribute__((always_inline))是强制内联函数。
+
+``CHDeclareClass`` 是声明需要hook的类。``CHOptimizedMethod``是替换现有的实现。``CHDeclareMethod``是声明一个新的方法。``CHConstructor`` 是在启动的时候调用，里面加上hook的代码，如``CHLoadLateClass``,``CHHook``。
+
+## FishHook
+
+FishHook也是可以使用的，用来hook c函数，只是一般用不上。
+
+# 注入
+
+主要库是yololib，注入的代码分析
+```c
+uint32_t dylib_size = (uint32_t)[data length] + sizeof(struct dylib_command);
+dylib_size += sizeof(long) - (dylib_size % sizeof(long)); // load commands like to be aligned by long
+
+// commands数量加1
+mach.ncmds += 0x1;
+// 记录原来的大小, 后面要跳转文件指针
+uint32_t sizeofcmds = mach.sizeofcmds;
+// commands的 size 增加
+mach.sizeofcmds += (dylib_size);
+// 回到 mach_header 的起始位置, 准备覆盖头部信息
+fseek(newFile, -sizeof(struct mach_header_64), SEEK_CUR);
+// 覆盖原本的mach_header头部信息
+fwrite(&mach, sizeof(struct mach_header_64), 1, newFile);
+// 跳过已有的load commands 部分
+fseek(newFile, sizeofcmds, SEEK_CUR);
+```
+
+```c
+// 从文件中读出dylib_command结构体, 按道理应该不太需要的...
+struct dylib_command dyld;
+fread(&dyld, sizeof(struct dylib_command), 1, newFile);
+// 开始组织注入的 dylib 信息
+dyld.cmd = LC_LOAD_DYLIB;
+dyld.cmdsize = (uint32_t) dylib_size;
+dyld.dylib.compatibility_version = DYLIB_COMPATIBILITY_VERSION;
+dyld.dylib.current_version = DYLIB_CURRENT_VER;
+dyld.dylib.timestamp = 2;
+dyld.dylib.name.offset = sizeof(struct dylib_command);
+// 回退并覆盖
+fseek(newFile, -sizeof(struct dylib_command), SEEK_CUR);
+fwrite(&dyld, sizeof(struct dylib_command), 1, newFile);
+// 写入 path 信息
+fwrite([data bytes], [data length], 1, newFile);
+// 后续输出一些结果信息
+NSLog(@"size %lu", sizeof(struct dylib_command) + [data length]);
+char buffer[4096];
+fread(&buffer, 4096, 1, newFile);
+printf("%s", buffer);
+```
+
+
+### dylb 加载过程
+
+- 设置上下文信息，配置进程是否受限  
+- 配置环境变量，获取当前运行架构   
+- 加载可执行文件，生成一个ImageLoader实例对象
+- 检查共享缓存是否映射到了共享区域
+- 加载所有插入的库
+- 链接主程序
+- 链接所有插入的库，执行符号替换
+- 执行初始化方法: +load 和 constructor是在这里执行的
+- 寻找主程序入口
+
+# 重签名
+
+code-sign命令行，或者ios-app-signer GUI的app。
+
+
+应用的构建过程:
+- compile:Clang编译
+- link:把生成的目标文件链接成一个可执行文件
+- storyboard:编译项目中storyboard文件
+- plist:生成plist文件，里面会指定应用的名字，bundleID等等
+- asset:将需要的资源文件复制到目标app下
+- dsym:生成符号文件
+- codesign，对app进行签名
+- package:把生成的文件放在Payload文件夹下，zip压缩成ipa。
+
+
+
+# 保护
+
+### 加密
+算法: BASE64/MD5/DES/AES/RSA
+
+##### 本地存储加密
+
+本地字符串，尤其是密钥要加密，用对称加密算法
+
+##### 网络传输数据
+
+用RSA+AES的方式可以。
+AES密钥随机生成
+
+### 静态混淆
+防止class-dump
+
+### 反动态调试
+
+在ptrace,sysctl,syscall函数上做文章。
+
+反反调试:可以通过hook函数，判断参数，返回结果。
+
+### 反注入
+
+旧版dyld检测到_restrict_ 的section就会注入失败。
+在other link flag里加上_restrict_ 就能反注入。 iOS10以上没用了。
+
+可以通过_dyld_get_image_name 判断模块名是否自己的白名单内，如果不是说明是注入的。

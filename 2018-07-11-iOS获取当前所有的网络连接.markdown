@@ -1,0 +1,62 @@
+---
+layout: post
+title:  "iOS获取当前所有的网络连接"
+date:   2018-07-09 11:23:32
+tags: iOS hack
+categories: iOS
+---
+做网络监控模块的过程中，有个小需求是打印当前所有的TCP连接。
+
+# iOS 获取当前的网络连接
+
+可以查到Stackoverflow:Network Activity Monitoring on iPhone:[http://stackoverflow.com/questions/19977759/network-activity-monitoring-on-iphone](https://stackoverflow.com/questions/19977759/network-activity-monitoring-on-iphone)
+
+原理：利用BSD的 ```sysctlbyname``` API,即可。但这个函数在iOS9以上被苹果禁用了。所以只能在iOS8或者模拟器上使用。
+
+参照inet,苹果开源的实现，里面有个protopr函数:
+[source code of inet](https://opensource.apple.com/source/network_cmds/network_cmds-396.6/netstat.tproj/inet.c)
+
+```c
+
+// 声明struct
+const char *mibvar;
+struct xinpgen *xig, *oxig;
+struct xgen_n *xgn;
+size_t len;
+struct xtcpcb_n *tp = NULL;
+struct xinpcb_n *inp = NULL;
+struct xsocket_n *so = NULL;
+struct xsockbuf_n *so_rcv = NULL;
+struct xsockbuf_n *so_snd = NULL;
+struct xsockstat_n *so_stat = NULL;
+
+//从sysctlbyname中获取数据
+if (sysctlbyname(mibvar, 0, &len, 0, 0) < 0) {
+  if (errno != ENOENT)
+    warn("sysctl: %s", mibvar);
+  return;
+}        
+if ((buf = malloc(len)) == 0) {
+  warn("malloc %lu bytes", (u_long)len);
+  return;
+}
+if (sysctlbyname(mibvar, buf, &len, 0, 0) < 0) {
+  warn("sysctl: %s", mibvar);
+  free(buf);
+  return;
+}
+
+//do some print
+...
+```
+
+需要参考inet，自己实现```xtcpcb_n```,```xinpcb_n```,```xgen_n``` ,```xinpgen```  等等数据结构体。
+
+stackoverflow上的答主提供了DHInet的实现，但是在我的模拟器上跑不通(因为太久远了)。
+
+我就参考inet里的，修改了DHInet的实现，主要是protopr函数和privateHeader.h里。
+代码见:
+
+[lilidan/InetTest](https://github.com/lilidan/InetTest)
+
+修改实现以后，在iOS9以下的手机，以及模拟器上就可以成功运行了...

@@ -1,0 +1,331 @@
+---
+layout: post
+title:  "iOS内存野指针定位"
+date:   2018-07-24 11:23:32
+tags: iOS 学习 总结 内存 BUG DEBUG 野指针
+cover: 'https://ws4.sinaimg.cn/large/006tKfTcgy1fshp9k4pz2j30pi0ht78g.jpg'
+categories: iOS
+---
+
+# 成因
+
+野指针就是指向一个已删除的对象或者受限内存区域的指针。
+我们写C++的时候强调指针初始化为NULL，强调用完后也为其赋值为NULL，谁分配的谁回收，来避免野指针的问题。
+比较常见的就是这个指针指向的内存，在别处被回收了，但是这个指针不知道，依然还指向这块内存。
+MRC 时代因为引用计数手动控制，所以内存很容易在别处被回收。ARC解决了大部分这种问题。、
+在iOS9之前，系统库的``delegate``和``target-action``有一部分是``assign(unsafe_unretain)``的形式，这时候如果内存在别处被回收了，也是会出现野指针的。
+所以iOS9之后这些地方就改成了weak内存修饰符，内存被回收的时候通过weak表，把这些指针设为nil。也大幅度减少了野指针的出现。
+
+如果现在在工程中依然频繁出现野指针，几乎可以肯定是错误地使用了内存。
+
+# 表现
+
+### Crash
+
+对于``Mach``、``Unix``、``NSException``三种不同层级的crash,NSException比较好说，可以直接定位到OC代码。问题主要来自``EXC_BAD_ACCESS(SIGSEGV)``这种异常，难以在我们的应用代码中定位。
+
+![](https://ws2.sinaimg.cn/large/006tKfTcgy1fsgplwoz6hj30se0h4wha.jpg)
+
+
+- SIGILL	执行了非法指令，一般是可执行文件出现了错误
+- SIGTRAP	断点指令或者其他trap指令产生
+- SIGABRT	调用abort产生
+- SIGBUS	非法地址。比如错误的内存类型访问、内存地址对齐等
+- SIGSEGV	非法地址。访问未分配内存、写入没有写权限的内存等
+- SIGFPE	致命的算术运算。比如数值溢出、NaN数值等
+
+
+实际我们遇到``Mach Exception``绝大部分都是野指针的问题。SIGSEGV/SIGABRT/SIGTRAP 比较多见。
+野指针问题表现千奇百怪，而且因为崩溃的地方并不是造成野指针的地方，而且难以重现，所以问题往往难以定位。
+![](https://ws4.sinaimg.cn/large/006tKfTcgy1fshp9k4pz2j30pi0ht78g.jpg)
+腾讯Bugly的这张图可以看到，野指针几乎可以造成各种类型的``Mach Exception``。
+
+### 内核野指针越狱
+
+如果是系统库的野指针，可以加以利用，实现从用户态控制到内核态，达到越狱的效果。
+比如iOS9的IOHIDResource，有个漏洞:
+![](http://www.vuln.cn/wp-content/uploads/drops/20160612/2016061208225493610414.png)
+
+因为_device已经被释放掉了，但是_device这个指针的内容并没有赋值为NULL,接着服务会去_device指向的内存地址查找vtable中的函数，如果我们能够在内存中malloc一段可控的内存并伪造一个fake的vtable，并且让这段内存刚好分配在_device所指向的地址，我们就可以成功的控制内核的PC指针了。
+
+# 定位工具
+
+## Zoombie Object
+
+这是目前帮助最大的调试模式。实现原理就是 hook 住了对象的dealloc方法，通过调用自己的``__dealloc_zombie``方法来把对象进行僵尸化。
+```c
+id object_dispose(id obj)
+{
+    if (!obj) return nil;
+
+    objc_destructInstance(obj);    
+    free(obj);
+
+    return nil;
+}
+```
+正常的对象释放方法如上，但是僵尸对象调用了``objc_destructInstance``后就直接return了，不再``free(obj);``。同时生成一个``"_NSZombie_" + clsName``类名，调用``objc_setClass(self, zombieCls);``修改对象的 isa 指针，令其指向特殊的僵尸类。
+如果这个对象再次收到消息,``objc_msgsend``的时候，调用abort()崩溃并打印出调用的方法。
+
+野指针指向的内存没有被覆盖的时候，或者被覆盖成可以访问的内存的时候，不一定会出现崩溃。这个时候向对象发送消息，不一定会崩溃(可能刚好有这个方法)，或者向已经释放的对象发送消息。 但是如果野指针指向的是僵尸对象，那就一定会崩溃了，会崩溃在僵尸对象第一次被其它消息访问的时候。
+
+
+#### Zombie Object without Xcode
+
+僵尸对象必须在连接Xcode中debug的时候使用，如果我们想跟我们的崩溃收集工具集成在一起，就需要自己实现类似Zombie Object的东西。
+逻辑是通过hook住NSObject的根类的dealloc方法，然后在新的dealloc方法中将本来即将释放的对象的isa指针改为指向我们创建的一个新的僵尸类。
+
+[iOS使用代码排查野指针错误
+](https://summer20140803.github.io/2017/12/25/iOS%E4%BD%BF%E7%94%A8%E4%BB%A3%E7%A0%81%E6%8E%92%E6%9F%A5%E9%87%8E%E6%8C%87%E9%92%88%E9%94%99%E8%AF%AF/)和 [开发自己的NSZombie](https://blog.csdn.net/without2002/article/details/43342675)这两篇文章里介绍了在代码里实现类似Zoombie Object的方法，然而实际上是无法使用的，这两种实现跟 Zombie Object 实现上不小的区别，实际应用中有大量误判的情况。
+
+误判的原因主要是dealloc的实现和僵尸类的实现跟Zombie Object不一样。
+参考Apple的源码，可以看到Apple是完全调用了``objc_destructInstance``函数的。而其它人的实现要么没有调用这个函数，要么只做了一部分。对于一个OC对象的dealloc来说，主要包括两部分，一部分是``objc_destructInstance``,一部分是``free(self)``。``objc_destructInstance``里包括了移除弱引用，移除关联对象，c++析构等等。这些逻辑不能省略。
+
+```objctive-c
+- (void)dealloc
+{
+    const char *className = object_getClassName(self);
+    char *zombieClassName = NULL;
+    do {
+
+        //...
+        Class zombieClass = objc_getClass(zombieClassName);
+
+        objc_destructInstance(self); //关键
+
+        object_setClass(self, zombieClass);
+
+    } while (0);
+
+    if (zombieClassName != NULL)
+    {
+        free(zombieClassName);
+    }
+}
+```
+
+而对于僵尸类的实现，Zombie Object的实现简洁而且有效。不像其它人的实现那么臃肿。就只是申明了一个没有任何方法的根类而已，所以任何消息发给它都会crash。
+
+```
+NS_ROOT_CLASS
+@interface _NSZombie_ {
+    Class isa;
+}
+
+@end
+```
+
+所以我从Apple的源码中提取出来的一套实现[NSZombie](https://github.com/lilidan/NSZombie.git)，跟Zombie Object的实现保证完全一致，解决误判的情况。
+
+
+## Scribble
+
+Scribble 工具能够在alloc的时候填上0xAA，dealloc的时候填上0x55，就是对象释放后在内存上填上不可访问的数据，如果再次访问对象就会必现crash。
+
+Bugly的这篇文章[如何定位Obj-C野指针随机Crash](https://blog.csdn.net/tencent_bugly/article/details/46277055) 就是采用这种方式提高crash率，来方便定位问题。
+为了不限制在xcode中使用，自己在代码中实现了类似的逻辑。通过fishhook去hook  ``free``函数的方法，实现如下：
+
+```c
+void safe_free(void* p){
+    size_tmemSiziee=malloc_size(p);
+    memset(p,0x55, memSiziee);
+    orig_free(p);
+    return;
+}
+```
+虽然已经给被释放的对象写上了0x55，但是如果是内存在被访问(触发crash)之前被其它覆盖了，则可能无法触发crash。 这种情况也不少见。 所以Bugly为了内存不被覆盖，就不再调用free来释放这个内存。保持这个内存一直在。  这样的原理就非常类似``Zombie Object``了。
+
+制造crash的方式也是采用修改rsa指针的方式，当对象收到消息的时候abort()。
+
+## Address Sanitizer
+
+将``malloc/free``函数进行了替换。在malloc函数中额外的分配了禁止访问区域的内存。 在free函数中将所有分配的内存区域设为禁止访问，并放到了隔离区域的队列中(保证在一定的时间内不会再被malloc函数分配)。 如果访问到禁止访问的区域，就直接crash。
+
+对CPU影响2~5⨉, 增加内存消耗 2~3⨉。
+
+能够检查出来的问题:
+- 访问已经dealloc的内存/dealloc已经dealloc的内存
+- dealloc还没有alloc的内存(但不能检查出访问未初始化的内存)
+- 访问函数返回以后的栈内存/访问作用域之外的栈内存
+- 缓冲区上溢出或下溢出,C++容器溢出(但不能检查integer overflow)
+
+不能用于检查内存泄漏。有些文章说ASan能检查内存泄漏是不对的，Google的LSan可以，但是Xcode的Asan不行。
+
+## Malloc Stack
+
+之前介绍的工具都是提高崩溃概率，以拿到崩溃的对象和内存地址。拿到崩溃的对象之后也很难定位，因为崩溃地方离释放的地方已经很远了。而且有些对象在工程中初始化了很多个，不知道是对应的哪个地方出了问题。所以如果能知道对象是在哪初始化的就好了。
+Malloc Stack 能够记录下来所有对象的malloc调用时的堆栈信息。然后我们执行命令：
+```c
+script import lldb.macosx.heap
+malloc_info --stack-history 0x7fbf0dd4f5c0
+```
+就可以在lldb中打印出来该对象初始化位置的堆栈信息。
+Malloc Stack但是有两个巨大的缺点，一个是只能在模拟器上使用，第二是没有打印出dealloc的信息。如果想在真机上使用需要越狱。
+
+#### lzMalloc
+
+公司内部的大神开发的的lldb插件，基于Malloc Stack开发的，通过调用私有函数拿到Malloc Stack记录的数据。能够支持真机调试，能够打印出dealloc的堆栈信息。
+能打印出dealloc的原因是hook了-dealloc方法，调用``__disk_stack_logging_log_stack``函数记录当前的堆栈信息。
+
+
+# 几个野指针的例子
+
+### 错误的内存修饰符
+
+遇到的这个例子可能是比较经典的野指针，崩溃日志中出现了各种各样的表现。
+
+第一种表现是dealloc对象时崩溃:
+
+```c
+0 libsystem_kernel.dylib 0x252fac5c __pthread_kill + 4
+1 libsystem_c.dylib 0x2528f0ac abort + 103
+2 libsystem_malloc.dylib 0x25324ef6 free + 431
+3 libobjc.A.dylib 0x24e13e08 object_dispose + 19
+4 Foundation 0x25de3cf2 -[NSIndexPath dealloc] + 66
+5 libobjc.A.dylib 0x24e24f66 objc_object::sidetable_release(bool) + 150
+6 libsystem_blocks.dylib 0x25243ac2 _Block_release + 215
+7 CoreFoundation 0x25583384 -[__NSArrayI dealloc] + 64
+5 libobjc.A.dylib 0x24e24f66 objc_object::sidetable_release(bool) + 150
+9 UIKit 0x29e934f2 __runAfterCACommitDeferredBlocks + 310
+10 UIKit 0x29e9f7da __cleanUpAfterCAFlushAndRunDeferredBlocks + 90
+11 UIKit 0x29bddb1c __afterCACommitHandler + 84
+```
+
+可以看到这里完全是系统library的崩溃，跟工程代码毫无关系，最开始也是一头雾水。
+这里只有两个线索,一个是``NSIndexPath``,另一个是只发生于10.3.3之前的iphone5机型上。
+因为10.3.3是iphone5支持的最后一个版本，所以用户量并不少。
+
+第二种表现是objc_msgsend, ``isEqual:``是通过读取ARM寄存器``lr``获取到的方法名，这个是Bugly帮我们查到的。
+
+```c
+0 libobjc.A.dylib 0x1a1b0dd6 objc_msgSend (isEqual:) + 15
+1 UIKit 0x201afdfa -[UICollectionReusableView _setLayoutAttributes:] + 60
+2 UIKit 0x209d0280 -[UICollectionView _applyLayoutAttributes:toView:] + 138
+3 UIKit 0x209daf26 ___88-[UICollectionView _dequeueReusableViewOfKind:withIdentifier:forIndexPath:viewCategory:]_block_invoke + 28
+4 UIKit 0x2015b5c2 +[UIView(Animation) performWithoutAnimation:] + 84
+5 UIKit 0x209dae40 -[UICollectionView _dequeueReusableViewOfKind:withIdentifier:forIndexPath:viewCategory:] + 2156
+6 UIKit 0x201af68a -[UICollectionView dequeueReusableCellWithReuseIdentifier:forIndexPath:] + 160
+7 XXXXXXProject 0x00404c02 -[XXXXXXCollectionView collectionView:cellForItemAtIndexPath:] (XXXXXXClass.m:77)
+8 UIKit 0x209cf850 -[UICollectionView _createPreparedCellForItemAtIndexPath:withLayoutAttributes:applyAttributes:isFocused:notify:] + 420
+9 UIKit 0x201af5e0 -[UICollectionView _createPreparedCellForItemAtIndexPath:withLayoutAttributes:applyAttributes:] + 42
+10 UIKit 0x201ad7f6 -[UICollectionView _updateVisibleCellsNow:] + 4076
+11 UIKit 0x201a83d6 -[UICollectionView layoutSubviews] + 398
+12 UIKit 0x2014b482 -[UIView(CALayerDelegate) layoutSublayersOfLayer:] + 1224
+```
+
+这里线索就比较丰富，可以找到对应的类了，``XXXXXXProject`` 是我们的工程，明显崩溃在``UICollectionView``中。在重用collectionViewCell的过程中，调用``_setLayoutAttributes`` 的方法，在+60的位置调用了``isEqual:``，经过反编译这个方法得知调用``isEqual:``的对象的是``UICollectionViewLayoutAttributes``(反编译过程省略)。
+这里也是只发生于10.3.3之前的iphone5机型上。所以基本确定是同一个问题。
+
+但是并没有什么了卵用，正如之前所说的，野指针崩溃的地方跟出错的地方相去甚远。
+唯一能确定的地方，就是引起崩溃的对象是``NSIndexPath``。
+
+第三种表现比较奇怪，报``[UITransitionView initialize] unrecognized selector ``,这个类一脸懵逼。不知道在哪使用过
+
+```c
+Exception Type: NSInvalidArgumentException(SIGABRT)
+Exception Codes: -[UITransitionView initialize]: unrecognized selector sent to instance 0x165f22c0 at 0x1c4d1acc
+Crashed Thread: 0
+0 CoreFoundation 0x1cd03b3d ___exceptionPreprocess + 129
+1 libobjc.A.dylib 0x1bf8b067 objc_exception_throw + 31
+2 CoreFoundation 0x1cd08fd1 ___methodDescriptionForSelector + 1
+3 CoreFoundation 0x1cd070c3 ____forwarding___ + 697
+4 CoreFoundation 0x1cc2fdc8 _CF_forwarding_prep_0 + 24
+5 libobjc.A.dylib 0x1bf8bbad _CALLING_SOME_+initialize_METHOD + 23
+6 libobjc.A.dylib 0x1bf8bdf3 __class_initialize + 579
+7 libobjc.A.dylib 0x1bf92c15 _lookUpImpOrForward + 173
+8 libobjc.A.dylib 0x1bf92b65 __class_lookupMethodAndLoadCache3 + 27
+9 libobjc.A.dylib 0x1bf991af __objc_msgSend_uncached + 15
+10 UIKit 0x21f98167 -[UICollectionViewLayoutAttributes isEqual:] + 95
+11 UIKit 0x21f97dfb -[UICollectionReusableView _setLayoutAttributes:] + 61
+12 UIKit 0x227b8281 -[UICollectionView _applyLayoutAttributes:toView:] + 139
+13 UIKit 0x227c2f27 ___88-[UICollectionView _dequeueReusableViewOfKind:withIdentifier:forIndexPath:viewCategory:]_block_invoke + 29
+14 UIKit 0x21f435c3 +[UIView(Animation) performWithoutAnimation:] + 85
+15 UIKit 0x227c2e41 -[UICollectionView _dequeueReusableViewOfKind:withIdentifier:forIndexPath:viewCategory:] + 2157
+16 UIKit 0x21f9768b -[UICollectionView dequeueReusableCellWithReuseIdentifier:forIndexPath:] + 161
+```
+
+看下面的堆栈就发现还是同一个问题，但是为啥会报这么奇怪的错？ 这就是野指针的表现。这一块内存被别的东西覆盖了。
+
+
+实际上还有其它的表现，但是比较具有代表性的就这三个了。从崩溃日志中只能得到有限的信息，一个是这个是野指针问题。第二个是这个野指针对象很可能是一个``NSIndexPath``对象(也不能完全确定)。
+
+如果不知道是野指针的问题，就很容易误入歧途，花大量时间在研究``UICollectionView`` 或者在研究``UITransitionView``上。其实都是浪费时间，因为造成野指针的地方地方已经很远了。
+
+正如Bugly这篇文章说的，定位野指针最重要还是增大野指针出现的概率。 所以这次我是采用Zombie Object，并且限制在iPhone5 和 iOS10.3.3的情况下重现的。
+
+经过多次重现，确定了是``NSIndexPath``的问题，而且所有的``UICollectionView``和``UITableView``都受到了影响。所以我开始怀疑是不是工程中有全局的代码被hook了。果然不出所料:
+```objectivec
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+    [invocation invokeWithTarget:self.target];
+    if (kiOS9Later) {
+        if ([NSStringFromSelector(invocation.selector) isEqualToString:@"collectionView:didSelectItemAtIndexPath:"]) {
+            //无痕打点
+            __unsafe_unretained UICollectionView *collectionView = nil;
+            id indexPath;
+            [invocation getArgument:&collectionView atIndex:2];
+            [invocation getArgument:&indexPath atIndex:3];
+            [FPPVHelper reportMTAEventId:[collectionView hotTagId] Index:[indexPath row] info:nil];
+        }
+    }
+}
+```
+这是某一段神奇的打点代码，不知道谁写的。很明显``indexPath``此处的修饰符应为``__unsafe_unretained``,如果为``strong``的话对象在这里就会被ARC释放掉，然而因为传递的是C指针，其它地方的某个指针不知道这里释放了，依然指向了这里。产生了野指针。
+
+
+### iOS9之前的delegate 崩溃
+
+在iOS9之前的tableview的delegate和datasource都是``assign``内存修饰符的。iOS9之后才使用``weak``。
+```objectivec
+// iOS 8 之前
+@property(nonatomic, assign) id<UITableViewDataSource> dataSource
+@property(nonatomic, assign) id<UITableViewDelegate> delegate
+// iOS 9 之后
+@property(nonatomic, weak, nullable) id<UITableViewDataSource> dataSource
+@property(nonatomic, weak, nullable) id<UITableViewDelegate> delegate
+```
+
+这种情况，如果``delegate``比``tableview``本身更早被释放，此时的``dataSource``就会成为一个野指针。常见的情况比如block调用延长了tableview的生命周期，就可能会发生这种情况，导致野指针crash。 一般崩溃日志里是``objc_msgsend + 15`` 的崩溃,崩溃在delegate或者datasource的方法里。
+
+
+解决方法也很简单，在dealloc的时候把dataSource和delegate设为nil即可。
+```objectivec
+- (void)dealloc
+{
+    _tableView.delegate = nil;
+    _tableView.dataSource = nil;
+}
+```
+
+### iOS9 之前的target-action崩溃
+
+崩溃堆栈也是最常见的objc_msgSend，这里可以看到是工程中hook的某个方法崩溃了
+
+```c
+libobjc.A.dylib objc_msgSend (pv_gestureRecongizerAction:)
+UIKit -[UIGestureRecognizer _updateGestureWithEvent:buttonEvent:]
+UIKit ____UIGestureRecognizerUpdate_block_invoke662
+UIKit __UIGestureRecognizerRemoveObjectsFromArrayAndApplyBlocks
+UIKit __UIGestureRecognizerUpdate
+SEGV_ACCERR
+```
+
+我们自己的代码如下，就是在``addGestureRecognizer``方法中加了一层调用，加了一层target-action。这相当于是给``gestureRecognizer``加了两个``target-action``
+
+```objectivec
+-(void)pv_addGestureRecognizer:(UIGestureRecognizer *)gestureRecognizer {
+    [gestureRecognizer addTarget:self action:@selector(pv_gestureRecongizerAction:)];
+    [self pv_addGestureRecognizer:gestureRecognizer];
+}
+```
+
+由于target对于gesture来说在iOS8上也是类似assign的，所以这里就是self被释放了，变成野指针了，但是gestureRecognizer的target依然指向了self的内存。  当self已经被释放了，但是gestureRecognizer还没被释放的时候就会发生这种情况。
+
+
+# 总结
+
+野指针定位有几个关键：
+- 第一是意识到这是野指针的问题:``Mach Exception``大多数都是野指针的问题，崩溃日志里最多见``objc_msgSend``和``unrecognized selector sent to``等等。而且往往跟iOS SDK版本和iphone型号有关。 认识到野指针的问题后，就不必要拘泥于崩溃日志，因为崩溃的地方离崩溃的原因比较远了。
+- 第二是尽可能重现。利用``Zombie Object/Scribble/Aasn`` 都可以。个人认为自己实现的Zombie Object最好，既可以脱离Xcode debug的限制，使用又比较简单。
+- 第三是根据野指针指向的对象来判断出错的位置，而不是崩溃的方法。因为崩溃的方法离崩溃的原因比较远了，但是野指针指向的对象多半还是出错的对象(有时也可能被覆盖了)。
+- 第四是利用``malloc stack/lzMalloc``找到野指针指向对象初始化的位置和dealloc的位置，判断是否过早释放等。

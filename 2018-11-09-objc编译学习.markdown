@@ -1,0 +1,93 @@
+## Clang
+
+源码 -> AST -> LLVM IR(中间语言) -> LLVM Bytecode -> ASM -> Native   Bitcode 是 LLVM-IR 的二进制表示形式 ASM是汇编语言
+
+
+前端编译过程：
+- Preprocesser: 包括#include #import等预处理, #if,#ifdef 等条件，#define等宏定义
+- Lexer:词法分析，把文本变成token(Tokenizer)
+- Parser:语法分析，把token变成AST
+
+后端编译过程:
+CodeGen生成LLVM-IR，进入编译器后端进行优化和汇编，最终生成目标文件(Mach-O)。
+
+#### 递归下降
+
+自顶向下是从起始非终结符开始，不断地对非终结符进行分解，直到匹配输入的终结符。表达式也是如此。
+
+## Core
+
+如果是编译器，由AST生成指令。
+虚拟机:在Objc的runtime，由AST执行成表达式或者runtime执行
+
+#### 表达式
+
+书上会用“逆波兰式”实现四则运算来讲解优先级问题。实际上可以用栈递归地调用。
+
+使用NSExpression和NSPredicate。
+考虑后续参考swift库Expression，自己实现性能更好的表达式引擎。
+
+#### runtime(OC方法调用)
+
+JSPatch和RN此处可以尝试用objc_msgsend提高性能
+
+###### calling Convention
+
+为什么不能用va_list? 32位才可以用,因为缺少通用寄存器，所以所有的参数都在栈上。64位有整数寄存器，浮点数寄存器，有的参数在栈上，有的在寄存器上。
+va_list 在32位直接是一个指针指向栈，后面的就是va_arg。 但是64位上是一个结构体，里面有register save area的offset，也有指向寄存器overflow后用来存储参数的栈的位置等等。
+
+
+###### NSInvocation
+
+目前采用类似JSPatch和ReactNative的方式，利用methodSignature封装NSInvocation调用。
+这种调用需要switch methodSignature的参数type 的字符串。针对各种类型的参数和返回值，比如int,float等等数字，SEL,IMP,void*结构体指针,nil空指针等等做downcast类型后再取地址&后传入。
+这种调用还有一个缺点是无法利用objc_msgsend的缓存优化。在调用次数非常多，比如上百次甚至上万次的时候，性能明显差于objc_msgsend。
+
+类型转换时，如果是alloc等等对象作为返回值，转换对象时不用`__bridge`而用`__bridge_transfer`。不然返回的对象并不会释放，造成内存泄露。alloc的是retain，而不是autorelease对象。
+
+###### objc_msgsend
+
+如果是不定参数调用，采用objc_msgsend,利用宏定义10个函数，需要downcast所有的函数指针。这个是针对stringWithFormat,arrayWithObjects等等。
+如果要全部采用objc_msgsend，实际上可以根据返回参数类型，downcast 10*4个，包括objc_msgsend,objc_msgsend_super,objc_msgsend_strect,objc_msgsend_fpret。
+优点是性能好，入参全部是id即可，不需要对入参downcast。缺点是需要对参数个数和返回类型downcast。
+
+###### super的调用
+
+对于NSInvocation方式，采用类似JSPatch的手法，先获取到对象的父类，然后拿到IMP，拿到之后重命名selector，添加Method给子类，调用新的selector(指向父类的IMP)。
+
+#### block
+
+先定义一个模仿block的结构体，做到参数对齐，然后copy一下，返回这个block指针，这个block就可以被调用了。
+
+block结构体(Block_layout)包括:
+- isa指针，NSConcreteStackBlock,NSConcreteMallocBlock等等
+- flags, 是个enum的，我们定义为BLOCK_HAS_COPY_DISPOSE | BLOCK_HAS_SIGNATURE，有引用计数，是否GC，是否deallocating等等
+- reserved; 保留
+- invoke，就是IMP指针，指向的函数指针。 这个函数指针 返回void，有几个参数包括`void *ret, void **args, void *userdata`。
+- descriptor1, 包括flags和size
+- descriptor2, copy和dispose的函数指针，入参为block
+- descriptor3, 包括signature和layout本身
+
+signature就是类似methodSignature，定义了block的入参和出参类型。
+
+#### C函数
+
+由于Calling Convetion的原因，C函数的动态调用必须要借助libffi。原理类似objc_msgsend，需要用汇编处理栈和寄存器的出入参调用。
+对于入餐和出参的个数和类型的downcast，还是必须借助MethodSignatrue，所以自己编写一套类似MethodSignatrue的工具，包括把类型声明如int float转成 字符，然后再根据字符反转成类型。再包装成ffi_type。
+根据ffi_type转换OC对象参数成C value，传入ffi_prep_cif_var，然后调用ffi_call。返回的时候把C的value转成OC 对象
+MethodSignatrue需要在我们使用C函数前自己定义。
+函数指针的获取通过dlopen/dlsym。但是无法上架。要用别的方式。
+inline函数不好调用。
+转换的过程，NSNumber封装数据value，SEL和IMP还有结构体用NSValue封装。id类型对象用`__bridge`来封装指针。
+
+#### struct
+对于iOS中常用struct，直接用OC来封装。
+对于不常见的struct，一般是C函数调用，封装成ffi_type 对其.需要传入类型定义。
+
+#### 性能
+
+单个函数调用比OC慢，比JS快。表达式比较慢。
+跟JSPatch对比。单个方法调用比JSPatch快100%，耗时只有JSPatch一半，多个方法调用优势更大，耗时可能只有1/3以下。都远远比OC慢。 词法分析/语法分析的过程此时已经完成。只是执行而已。
+NSInvocation的调用跟Native速度差不多。关键慢在参数上下文传递。
+表达式比JSCore慢。
+比JSPatch快的原因是没有JS和OC的通信，没有参数转换(尤其是集合类型)。

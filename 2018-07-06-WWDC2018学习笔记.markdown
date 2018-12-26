@@ -1,0 +1,192 @@
+---
+layout: post
+title:  "WWDC2018学习笔记"
+date:   2018-07-06 11:23:32
+tags: iOS WWDC 学习 总结
+cover: '/images/2018-07-06.jpeg'
+categories: iOS
+---
+
+
+看了一部分的WWDC Session，没有看Swift的内容、Group Notification的内容、安全密码自动完成的内容。总体上干货不多，有一些新的细节。
+
+
+# 202 What's New in Cocoa Touch
+### Scrolling
+
+为了滚动流畅，在iPhone中要60fps，iPad Pro是120fps。
+
+在iOS10增加了```UITableViewDataSourcePrefetching```这个delegate。
+这个delegate有
+```tableView(_ tableView: UITableView, prefetchRowsAt indexPaths: [IndexPath])```和
+```tableView(_ tableView: UITableView,cancelPrefetchingForRowsAt: indexPaths [IndexPath])```两个方法。用于预加载UITableview或者UICollectionView
+
+原先在UITableView滚动中，会对每一个Cell有如下操作
+- Dequeue or allocate cell
+- Populate cell with model data
+- call layoutSubviews on UIViews in the cell
+- call draw() on UIViews in the cell
+
+现在可以把Populate cell with model data提前到```prefetchRowsAt```方法中
+
+### Autolayout
+
+苹果优化了Autolayout，变快了
+
+
+### Memory
+
+有时候app突然需要很大块的内存，比如加载一个大图片然后解压缩。这个时候，系统中空闲内存会不够，系统需要从其它的App或者系统本身中获取内存。这个释放其它App的内存的操作是消耗CPU的。所以内存会影响Performance。
+
+#### Automatic Backing Store
+以前UIView drawRect等等都会创建一个Backing Store，就是一个缓冲区，将CPU计算好的内容存储，提交给GPU渲染。
+之前每个像素都是64bpp的，所以很占内存，现在可以按需创建，比如如果用来渲染一个8bpp的图片，就Backing Store中的像素也是8pp的。
+
+这些方法会采用Automatic Backing Store:
+
+- UIView.draw()
+- UIGraphicsImageRenderer
+- UIGraphicsImageRendererFormat.Range:可以指定Backing Store参数
+
+
+# 803 Designing Fluid Interfaces
+主要是讲设计方面的。
+下面这段代码，讲Facetime原先是简单的手势-位置，计算位移。后来加入Dynamic Motions。 位移中要充分考虑到当前的速度Velocity和decelerationRate(从ScrollView中获取)，然后简单的计算后，能做出像ScrollView一样自然的交互。
+
+```java
+// Distance travelled after decelerating to zero velocity at a constant rate.
+func project(initialVelocity: Float, decelerationRate: Float) -> Float {
+return (initialVelocity / 1000.0) * decelerationRate / (1.0 - decelerationRate)
+}
+
+// After the PiP is thrown, determine the best corner and re-target it there.
+let decelerationRate = UIScrollView.DecelerationRate.normal
+let projectedPosition = (
+x: x.value + project(initialVelocity: x.velocity, decelerationRate: decelerationRate)
+y: y.value + project(initialVelocity: y.velocity, decelerationRate: decelerationRate),
+)
+let nearestCornerPosition = nearestCornerTo(projectedPosition)
+ x.target = nearestCornerPosition.x
+```
+
+宣传如下理念：
+- Continuous behaviors, not timed animations(强调持续交互，我理解为用户的每一个手势操作的输入都应该对应一个UI上的连续的输出，而不是播放设定好的动画。)
+- Draw inspiration from the physical world(交互是物理世界的延伸。所以iOS的ScrollView才能如此自然。)
+- Springs don’t need to be springy!  (之前流行了很多Spring的库，不用滥用和迷信)
+- Align motion with intent (Dynamic Motions要跟用户真正的操作意图匹配)
+
+# 207 Securing Web Content
+
+### Secure Transport
+
+HTTPS 反复强调。HTTPS是移动端Web安全的基础。
+
+ - HTTPS and WSS
+ - Strict Transport Security (HSTS),auto upgrade domain
+ - Upgrade Insecure Requests (UIR),Auto-upgrades cross-origin loads
+ - Secure Cookies,Are never sent in plaintext
+
+### Cross-origin lockdown
+
+修改一些配置和策略。达到限制跨域的目的。
+
+- Subresource Integrity:Simple markup change to script tags
+- Content Security Policy:Server configuration + architectural changes
+- HttpOnly cookies
+- SameSite cookies
+- Cross-Origin-Resource-Policy
+- Cross-Origin-Window-Policy
+
+
+### 防御的对象和方式
+#### Cross-origin attacks
+- 上述Cross-origin lockdown
+
+#### Speculative execution attacks
+- WKWebView能够部分防范，因为Web进程不在App进程里，互相独立。
+- Content Security Policy
+- HttpOnly cookies
+- SameSite cookies
+- Cross-Origin-Resource-Policy
+
+#### Window control attacks
+- Cross-Origin-Window-Policy header
+
+![](/images/2018-07-06.jpeg)
+
+# 407 Practical Approaches to  Great App Performance
+
+Cool,Warm,Hot启动的不同: Warm启动是指重启后已经启动过一次。Mach-O文件有一些缓存。
+
+主要讲Photos的启动优化过程。
+
+### Luanch优化
+优化目标是600ms,跟启动动画的时间一样
+
+- Load/Link dylibs，Run static initializers,main函数之前分配100ms
+- main/UIApplicationMain，willFinishLaunching，didFinishLaunching，First layout,main函数之后分配500ms
+
+#### 优化措施:
+- 更早地初始化db
+- 只加载必须的内容，其它的内容异步加载，数据和view和vc都是
+- 结合lazy init减少初始化的内容。
+- 加载缩略图。
+- 把多个view的layout对象合并成图片。
+- 利用缓存和background fetch，减少网络请求的依赖。
+
+# 222 Data You Can Trust
+主要是讲如何保护数据可用性。
+- 提供了```NSDecodingFailurePolicy```,有throw Exception和返回nil两种方式，可以配置。(比如开发环境和生产环境)
+- 提供```NSSecureCoding```协议和```supportsSecureCoding```属性
+- 提供了```decodeObjectOfClass:(Class)aClass forKey:(NSString *)key```方法来替代之前的```decodeObjectforKey:(NSString *)key```
+
+常见如下data异常：
+- 日期字符串返回格式不对
+- 为空：stringByAppending:String操作，set，add子类的为空判断。
+- 可能为空字符串""
+- 类型不对，数字和字符串不符合，cast的时候crash
+- 不符合json标准格式，解析失败
+- 可能数字极大或极小不符合正常范围。负数。
+- 可能缺少某个key字段
+- 可能url不符合格式
+
+所以需要类似guard-throw的机制，在数据解析的每一个层级抛出对应的异常，最后交由业务处理。
+
+在数据解析的过程中，每一个步骤的操作都需要检查，如果异常就在该步骤(层级)抛出异常并提交处理。
+
+- Checksum/Count:检查二进制数据完整
+- Known Format:Json
+- Valid Structure:数据结构符合
+- Valid Semantics:数据本身符合正常范围
+
+# 416 iOS Memory Deep Dive
+
+### 内存机制
+内存中每一页大小16KB
+
+内存分为clean/dirty，如果啥都没有就是clean
+
+必须在在memorywarnning的时候remove cache(强调了很多次)
+
+### 提供了cli工具来profile
+
+- malloc_history -来track对象的创建
+- leaks -寻找循环强引用
+- vmmap, heap-Size -获取虚拟内存和堆内存的使用情况
+
+### 针对Image的内存优化
+Memory use is related to the dimensions of the image, not the file size.
+
+#### 绘制Image
+Stop using UIGraphicsBeginImageContextWithOptions，4bytes per pixel
+开始使用UIGraphicsImageRenderer。正如上文说的有Automatic Backing Store
+
+#### 重采样Image
+UIImage is expensive for sizing and to resizing
+Will decompress original image into memory Internal coordinate space transforms are expensive
+
+ImageIO can read image sizes and metadata information without dirtying memory。ImageIO can resize images at cost of resized image only。
+
+#### 处理image的缓存对象
+当页面没有显示的时候，手动把那些大的图片对象释放掉:
+loadImages/unloadImages，在viewWillAppear/viewWillDisappear，以及App enterForeground和App EnterBackground

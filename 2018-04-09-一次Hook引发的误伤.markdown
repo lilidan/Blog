@@ -1,0 +1,137 @@
+---
+layout: post
+title:  "一次Hook引发的误伤"
+date:   2018-04-09 11:23:32
+tags: iOS bug
+categories: iOS
+---
+### 表现
+在调试App的UI时，触发了一个crash
+![](/images/2018-04-09.jpeg)
+
+在搜索页中输入任何字，app就直接崩溃。还是挺严重的，好在目前用户量还不多。
+
+### 定位
+本来以为是很简单的crash，因为必现，影响面应该很广。打开崩溃信息看看。
+
+
+```objectivec
+2018-06-14 19:11:01.421448 xxx[7167:861789] *** Assertion failure in -[UICollectionViewData layoutAttributesForItemAtIndexPath:], /BuildRoot/Library/Caches/com.apple.xbs/Sources/UIKit/UIKit-3600.5.2/UICollectionViewData.m:709
+2018-06-14 19:11:01.569933 xxx[7167:861789] [Bugly]  Trapped uncaught exception 'NSInternalInconsistencyException', reason: 'no UICollectionViewLayoutAttributes instance for -layoutAttributesForItemAtIndexPath: <NSIndexPath: 0xc000000000000016> {length = 2, path = 0 - 0}'
+(
+ 0   CoreFoundation                      0x00000001863821d8 <redacted> + 148
+ 1   libobjc.A.dylib                     0x0000000184dbc55c objc_exception_throw + 56
+ 2   CoreFoundation                      0x0000000186382094 <redacted> + 0
+ 3   Foundation                          0x0000000186e0f79c <redacted> + 112
+...
+)
+```
+
+奇怪的地方就出现了，这里看肯定是UICollecionView的`layoutAttributesForItemAtIndexPath:`方法没有返回或者子类没有实现。
+但是该页面我们并没有使用UICollecionView。
+
+
+### 陷阱
+
+按照输入后崩溃的迹象，怀疑是UISearchBar的API操作不当导致，所以最初在SearchBar上找问题，review了一下代码，并没有发现破绽。然后删掉代码，依然crash。
+
+浪费了一些时间在UISearchBar上。
+还浪费了一些时间在Google搜索这个崩溃的日志上，并没有人遇到类似的问题。
+
+### 走出陷阱
+
+后来改变方向，发现以下规律：
+1.App中所有的输入框，包括UITextField，UITextView 都会crash
+2.crash出现在系统自带的九宫格中文输入法。其它输入法没有问题。
+3.只出现在iOS10以下，iOS11没有问题
+
+根据以上规律，猜测这个UICollectionView很可能是九宫格输入法本身或者附属的View。
+按理来说这是系统层面的API，不知为何会受到APP影响。
+考虑到现在大量的第三方库都使用了Method Swizzling，所以怀疑是第三方库全局Hook了某些私有API导致。
+
+在工程中搜索下`+(void)load` 方法，因为调用它的几乎都是hook。发现有30多处。其中肯定有不少属于不该使用的。
+
+
+### 问题所在
+
+找到了问题所在。下面代码省略了一些非关键方法。
+
+
+```objectivec
+@interface _UICollectionProxy : NSProxy
+
+@property (nonatomic, weak) id target;
+- (instancetype)initWithTarget:(id)target;
+
+@end
+
+@implementation _UICollectionProxy
+
+- (instancetype)initWithTarget:(id)target
+{
+    self.target = target;
+    return self;
+}
+
+- (void)forwardInvocation:(NSInvocation *)invocation
+{
+	//消息转发
+    [invocation invokeWithTarget:self.target];
+    if ([NSStringFromSelector(invocation.selector) isEqualToString:@"collectionView:didSelectItemAtIndexPath:"]) {
+          // 植入打点代码，进行无痕打点
+          ...
+     }
+}
+
+@end
+@implementation UICollectionView (FPPVHelper)
+
++ (void)load
+{
+    [[self class] jr_swizzleMethod:@selector(setDelegate:) withMethod:@selector(pv_setDelegate:)];
+}
+
+- (void)pv_setDelegate:(id<UICollectionViewDelegate>)delegate
+{
+     UICollectionProxy *proxy = [[_UICollectionProxy alloc] initWithTarget:delegate];
+     [self pv_setDelegate:(id<UICollectionViewDelegate>)proxy];
+}
+@end
+```
+
+这里为了记录日志，对UIColletionView的```setDelegate:```方法进行methodSwizzling。然后利用了NSProxy，进行delegate的消息转发。当消息转发的过程中遇到了`collectionView:didSelectItemAtIndexPath:`就进行一次埋点记录。
+
+然后给`pv_setDelegate:`方法打断点，果然发现有个私有的类被Hook了。
+这个类名叫`UIKBCandidateCollectionView`，delegate是`UIKeyboardCandidateBar` 都是私有的类，可以到[Runtime-Headers](https://github.com/nst/iOS-Runtime-Headers/blob/master/Frameworks/UIKit.framework/UIKeyboardCandidateBar.h "Runtime-Headers")去看他们的具体定义。
+这两个类确实是用于系统中文九宫格输入法的，符合我之前的猜测。
+这里纯粹属于被误伤了，对UICollectionView的hook也影响了私有API。
+至于为什么会导致崩溃，考虑是因为delegate被设置成了NSProxy。这个NSProxy虽然可以通过`forwardInvocation:`消息转发，但是并没有能够真正替代`UIKeyboardCandidateBar` 发挥delegate的作用。这个类内部应该有一些非正常的实现，无从考证。
+
+### 解决
+
+因为不能使用私有API，所以只能做得Ugly一点，就想到一个纯字符串比对的方法。只要判断到是这一对被误伤的兄弟，就不要转发到proxy，而是保持原样。
+
+```objectivec
+- (void)pv_setDelegate:(id<UICollectionViewDelegate>)delegate
+{
+    if (delegate) {
+        NSString *delegateName = NSStringFromClass([delegate class]);//UIKeyboardCandidateBar
+        NSString *clsName = NSStringFromClass([self class]);//UIKBCandidateCollectionView
+        NSString *delegateName2 = [delegateName stringByReplacingOccurrencesOfString:@"Keyboard" withString:@"KB"];
+        NSString *clsName2 = [clsName stringByReplacingOccurrencesOfString:@"CollectionView" withString:@"Bar"];
+        if (![delegateName2 isEqualToString:clsName2]) {
+            _UICollectionProxy *proxy = [[_UICollectionProxy alloc] initWithTarget:delegate];
+            [(NSObject *)delegate bk_associateValue:proxy withKey:@"_UICollectionProxy"];
+            [self pv_setDelegate:(id<UICollectionViewDelegate>)proxy];
+            return;
+        }
+    }
+    [self pv_setDelegate:delegate];
+}
+```
+
+
+### 总结
+1.AOP、黑魔法、Hook的方法都是有副作用的，毕竟是全局的，使用时要当心坑，可能会误伤到系统私有API。
+
+2.查问题时还是要分析客观现象，搜集足够的信息。google不是万能的。

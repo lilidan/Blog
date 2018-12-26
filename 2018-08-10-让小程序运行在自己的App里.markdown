@@ -1,0 +1,207 @@
+---
+layout: post
+title:  "让别人的小程序运行在自己的app中"
+date:   2018-08-10 11:23:32
+tags: iOS 学习 总结 小程序 hera
+cover: 'https://blog-10039692.file.myqcloud.com/1484042597184_7704_1484042597242.jpg'
+categories: iOS
+---
+## 概要
+
+
+本文包括的内容:
+- 小程序在微信开发者工具中，通过构建生成真正的执行代码和安装包，****.wxapkg。wxml和wxss在构建这一步就被转换成了html和css(virtual-DOM)。微信开发者工具中可以得到构建脚本和各个版本的js运行SDK文件。
+- 小程序是以wxapkg文件的形式下发的，可以拿到wxapkg后解压拿到执行代码。同时解压微信.ipa拿到当前的js运行SDK文件,主要是WAWebView.js和WAService.js。
+- 小程序在App中执行时的时候分为三个不同的模块，View/Service/Natvie，各司其职。
+- 实现过程遇到大量的细节和坑。
+
+介绍小程序原理的文章比较多，这篇讲的比较细:[微信小程序架构分析](https://zhuanlan.zhihu.com/p/22754296)。这篇文章的作者也成功的实现了[wept](https://github.com/chemzqm/wept.git),让小程序运行在自己的webapp里。
+
+参考最多的是微店的[Hera](https://github.com/weidian-inc/hera),完成度非常高的小程序框架，能够将小程序的demo代码在web/iOS/android运行起来，而且实现了很多工具。Hera的问题是开发于比较早期的版本，不兼容最新的版本了。Hera还有一个问题是他修改了小程序构建之后的目录结构，采用了service.html作为service部分的入口，跟小程序本身的实现尚有有一些区别。所以Hera只能够构建执行自己编写的小程序，不能执行别人编写的小程序。
+
+我的目标是能够运行其它人开发的app，意味着我只能通过逆向的方式拿到wxapkg。但是因为拿不到源码，所以要尽可能在构建环节跟小程序保持一致。
+
+经过数周的挣扎，目前已经实现了运行官方demo。已经达到"可行"的阶段，但是还远远谈不上“可用”，因为需要实现小程序大量的API，这是个体力活，依赖个人的力量难以完成。
+
+## 构建
+
+官方demo小程序原先的目录分为几类文件:
+- 配置: 在这个目录中，app.json里保存了页面信息、tabbar信息、网络超时配置等等。 config.js保存了腾讯云后台服务解决方案的配置。
+- js文件: js定义了各种函数接口逻辑
+- wxml: 类似于html,定义了页面结构
+- wxss: 类似css
+
+```bash
+demo
+├── app.js
+├── app.json
+├── app.wxss
+├── config.js
+├── image
+│   ├── green_tri.png
+│   ├── ...
+├── page
+│   ├── API
+│   │   ├── index.js
+│   │   ├── index.json
+│   │   ├── index.wxml
+│   │   ├── index.wxss
+│   │   ├── pages
+│   │   │   ├── action-sheet
+│   │   │   │   ├── action-sheet.js
+│   │   │   │   ├── action-sheet.json
+│   │   │   │   ├── action-sheet.wxml
+│   │   │   │   └── action-sheet.wxss
+│   │   │   ├── ...
+│   │   └── resources
+│   │       └── ...
+│   ├── ...
+├── project.config.json
+├── util
+│   └── util.js
+└── vendor
+    └── qcloud-weapp-client-sdk
+        ├── ...
+
+```
+
+
+经过小程序的开发环境构建后，生成了一个*.wxapkg文件。
+这个文件可以通过从越狱的iPhone或者root的安卓手机上拿到。有部分人用charles通过https抓包拿到了下载链接，也拿到了包。
+拿到后要进行解包。有大神已经通过反编译安卓apk的方式拿到了解包部分的代码，然后用python重写了一遍。源码见[wechat-app-unpack](https://github.com/leo9960/wechat-app-unpack)。
+
+解包后得到的目录如下:
+
+```bash
+1.wxapkg_dir
+├── app-config.json
+├── app-service.js
+├── app-service.js.map
+├── image
+│   ├── green_tri.png
+│   ├── ...
+├── page
+│   ├── API
+│   │   ├── index.html
+│   │   ├── pages
+│   │   │   ├── action-sheet
+│   │   │   │   └── action-sheet.html
+│   │   │   ├── ...
+│   │   └── resources
+│   │       └── kind
+│   │           ├── api.png
+│   │           ├── ...
+│   ├── ...
+└── page-frame.html
+```
+
+转换过程可以分为三部分:
+- 从wxml/wxss到html。 page-frame.html里定义了所有的virtural-dom，来自所有的wxss和wxml的转换，文件非常大。 page.html里很简单，就是从page-frame.html里提取对应的virtual-dom。包括wxss和wxml对应的逻辑。
+- app-service.js是从之前所有的js文件转换而来。
+- app-config.json是从app.json转换而来。
+
+
+``openVendor``命令可以在小程序中获取到构建脚本wcc和wcsc, 以及各个版本小程序的执行SDK ****.wxvpkg,这个SDK也可以用[wechat-app-unpack](https://github.com/leo9960/wechat-app-unpack)解开，解开后里面就是WAService.js和WAWebView.js等代码。
+
+#### wxml/wxss的构建原理
+
+wxss 转换成了css,wxml转换成了inject_js，实际上就是virtual_dom。
+是用什么工具转换的？小程序里是叫wcc和wcsc。在开源工具hera自己实现了一套wxss-transpiler和wxml-transpiler。而hera的前身wept是直接使用wcc和wcsc。
+我们为了减少维护成本，直接采用wcc和wcsc。
+因为我们没有wcc和wcsc的源码，所以只能借助wxss-transpiler和wxml-transpiler来帮助我们理解wxml/wxss的构建原理。
+
+wxss-transpiler调用了一个PostCSS的插件，用来处理wxss。
+PostCSS 提供了一种方式用 JavaScript 代码来处理 CSS。它负责把 CSS 代码解析成抽象语法树结构（Abstract Syntax Tree，AST），再交由插件来进行处理。插件基于 CSS 代码的 AST 所能进行的操作是多种多样的，比如可以支持变量和混入（mixin），增加浏览器相关的声明前缀，或是把使用将来的 CSS 规范的样式规则转译（transpile）成当前的 CSS 规范支持的格式。
+
+wxml-transpiler:实现了一个转译器的工作，比如postcss也是转译器，包括解释器(parser),代码转换器(Transformer),代码生成器(Generator)。这个是闭源的。
+- 根据输入的列表，读取所有文件
+- 调用VUE的HTML Parser，解析输入的标签及属性，生成一颗DOM树。vue解决不了的js语言，用babylon库来处理。(Parse)
+- 在解析组件的标签时，对其上包含的属性值进行解析（边Parse边Transform）
+- 根据已有的AST生成JS文件（Generate）
+
+更多实现原理见[这篇文章](https://github.com/IOriens/ioriens.github.io/issues/5)
+
+## 模块之前的通信
+
+![](https://blog-10039692.file.myqcloud.com/1484042597184_7704_1484042597242.jpg)
+
+小程序在App中执行时的时候分为三个不同的模块，View/Service/Native，各司其职。
+
+View和Service都在WKWebView中执行，互相无法调用。他们之间通过Native层通信。
+
+Native和WebView之间通过webkit.messagehandler和evaluateJavascript互相调用。
+
+- WeixinJSBridge.publish: view和service之间的透传，在WKWebView之间传递消息。
+
+- WeixinJSBridge.subscribe: 注册监听，监听view和service之间的消息调用。
+
+- WeixinJSBridge.invoke: View或者Service传递消息到Native,然后Native使用逻辑调用js callback。
+
+- WeixinJSBridge.on:监听Native的事件。
+
+
+## 如何执行
+
+这里以iOS为例介绍Native执行过程。安卓类似。
+
+
+通过解压微信的ipa可以拿到WAService.js和WAWebView.js两个基础库文件，文件内容与hera的service.js/view.js已经有了较大的区别。
+我们采用小程序的架构和hera的两个webView的方案，尽可能模仿小程序的执行过程。
+
+#### View部分
+
+View部分是比较直观的，就是WKWebView加载web页。这里需要在app-config.json里读取到首页的路径，然后加载该页面。这个路径下的xxx/index.html是无法直接加载的，需要做一些处理。要引入本地执行SDK里的index.css和view.js, 然后把``page-frame.html``里的virtual-dom全部塞进该页面。 然后loadHTML即可。
+
+View所有的WKWebView也是要注册WKUserContentController的，用于通信。
+通过反汇编可以得知这个类在微信中叫``YYWAWebView``，调用js是直接调用``-evaluateJavaScript:completionHandler:``方法的。
+
+view.js中包含的逻辑:
+- WeixinJSBridge 对象处理消息通信: invoke invokeCallbackHandler on publish subscribe subscribe subscribeHandler。
+- Reporter 对象
+- wxparser 对象，提供 dom 到 wx element 对象之间的映射操作，提供元素操作管理和事件管理功能。
+- virtual dom 渲染算法实现，提供 diff apply render 等方法，该模块接口基本与 virtual-dom 一致，这里特别的地方在于它所 diff 和生成的并不是原生 DOM，而是各种模拟了 DOM 接口的 wx element 对象
+
+#### Service部分
+
+Service部分的实现，Hera和微信小程序采取的了不同的架构。
+Hera的实现较为简洁，跟View部分保持一致，采用了WKWebView，调用``-evaluateJavaScript:completionHandler:``方法执行js，js回调OC时使用WKScriptMessageHandler。
+通过反汇编可以得知这个类在微信中叫``WAJSCoreService``，js和OC之间的调用是采用JavascriptCore互相调用。
+
+JavascriptCore它首先要加载app-config.json并把这个配置赋给一个全局对象__wxConfig。然后他要加载service.js是SDK基础,再然后他要加载app-service.js，这里面包含了用户编写的js逻辑。最后它发出全局消息
+``WeixinJSBridge.publish('serviceReady',,);</script>``唤起小程序app的初始化。
+
+Service.js中包含的逻辑:
+- 跟 view.js 一样的 WeixinJSBridge 兼容模块
+- view.js 一样的 Reporter 模块
+- appServiceEngine 模块，提供 Page，App，GetApp 接口
+
+####  Native部分
+
+Native执行的问题比较复杂，因为基本是黑盒，里面发生了什么并不知道。
+hera的方案在构建过程就已经跟小程序实际的方案有所区别，会提高维护成本。所以我们只能靠猜测来实现Native的执行过程。
+
+Native部分就是作为入口，运行环境，跳转，转发消息，实现扩展。包括网络模块/摄像头/tabbar实现的都是扩展。
+我们可以得知的是消息传递的协议。然后只能通过safari来调试webView，根据协议的名称和出入参来猜测协议的内容。
+
+## 主要的困难点
+
+- 由于压缩后的view.js和service.js基本不具备可读性，而virtual-dom又彻底不具备可读性...所以就算猜中了协议，最后也往往是魔改。可维护性极差。
+- 工作量不小，因为调试困难，无法阅读。之后随着小程序SDK升级，能用多久也不可知。加上也有各种微逆向的操作，小程序封上任何一个接口，都会导致扑街。可持续性极差。总之非常佩服微店的同学能把Hera搞出来:)
+
+
+## 小程序的性能启发
+
+小程序是颠覆我对Web的固有印象,最初还以为是类似weex或者rn的调用原生的方式，没想到几乎完全是运行在WKWebView之上的。
+
+- 采用virtual DOM，操作JS比html性能高很多，因为是diff后再操作dom，不需要全部重新渲染，快很多。
+- WKWebView，滑动60fps，在独立于App之外的进程执行。
+- 部分逻辑Native化，比如收发网络请求，比如数据持久化。 逐步用native组件来替换h5组件。比如tabbar。
+- 重用webView以及提前初始化webView等等技巧。
+
+存在的问题:
+- 看消息传递的原理就能发现，传递的过程太长了，尤其是``setData:``这种传递整个model对象，是两次对象的深拷贝，可能会增加两次json的序列化和反序列化，如果model对象很复杂对性能影响比较大。
+- 页面初始化/响应速度/UI细节还是跟原生有差距。
+
+当然已经比纯web页强很多了。目前来看还是只适合轻量化的应用。受制于架构以及微信的平台，个人认为是对Web的替代和改善。但是就算在可见的未来，还是很难跟native抗衡。
+
+现代浏览器和操作系统之间的界限越来越模糊。App的"下载/安装"过程本身就是一种妥协。只要小程序的体验足够好,应该没有人会拒绝。
