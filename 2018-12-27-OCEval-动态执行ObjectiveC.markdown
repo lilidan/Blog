@@ -14,8 +14,11 @@ NSNumber *result = [OCEval eval:inputStr]; // result: @(YES)
 
 为了实现跟JSPatch类似的热修复功能，增加了方法替换。我们就可以通过下发Objective-C代码进行现有App的方法替换，来进行热修复的功能。
 
+In order to fix bugs dynamically,we should be able to replace original Objective-C method. We could deliver Objective-C code through network,like this:
+
+
 ```objc
-//在新的imp里直接调用旧的方法实现
+//call original invocation in new implementation
 NSString *viewDidLoad2 = @"{\
 [originalInvocation invoke];\
 ";
