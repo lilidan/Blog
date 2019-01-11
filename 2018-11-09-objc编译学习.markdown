@@ -27,15 +27,15 @@ CodeGen生成LLVM-IR，进入编译器后端进行优化和汇编，最终生成
 使用NSExpression和NSPredicate。
 考虑后续参考swift库Expression，自己实现性能更好的表达式引擎。
 
-#### runtime(OC方法调用)
+## 细节
 
-JSPatch和RN此处可以尝试用objc_msgsend提高性能
+#### runtime(OC方法调用)
 
 ###### calling Convention
 
-为什么不能用va_list? 32位才可以用,因为缺少通用寄存器，所以所有的参数都在栈上。64位有整数寄存器，浮点数寄存器，有的参数在栈上，有的在寄存器上。
-va_list 在32位直接是一个指针指向栈，后面的就是va_arg。 但是64位上是一个结构体，里面有register save area的offset，也有指向寄存器overflow后用来存储参数的栈的位置等等。
 
+对于可变参数为什么不能用va_list? 32位才可以用,因为缺少通用寄存器，所以所有的参数都在栈上。64位有整数寄存器，浮点数寄存器，有的参数在栈上，有的在寄存器上。
+va_list 在32位直接是一个指针指向栈，后面的就是va_arg。 但是64位上是一个结构体，里面有register save area的offset，也有指向寄存器overflow后用来存储参数的栈的位置等等。
 
 ###### NSInvocation
 
@@ -43,7 +43,7 @@ va_list 在32位直接是一个指针指向栈，后面的就是va_arg。 但是
 这种调用需要switch methodSignature的参数type 的字符串。针对各种类型的参数和返回值，比如int,float等等数字，SEL,IMP,void*结构体指针,nil空指针等等做downcast类型后再取地址&后传入。
 这种调用还有一个缺点是无法利用objc_msgsend的缓存优化。在调用次数非常多，比如上百次甚至上万次的时候，性能明显差于objc_msgsend。
 
-类型转换时，如果是alloc等等对象作为返回值，转换对象时不用`__bridge`而用`__bridge_transfer`。不然返回的对象并不会释放，造成内存泄露。alloc的是retain，而不是autorelease对象。
+类型转换时，如果是alloc等等对象作为返回值，转换对象时不用`__bridge`而用`__bridge_transfer`，把对象在C++里释放，控制权移交给OC。不然返回的对象并不会释放，造成内存泄露。alloc的是retain，而不是autorelease对象。
 
 ###### objc_msgsend
 
@@ -51,13 +51,24 @@ va_list 在32位直接是一个指针指向栈，后面的就是va_arg。 但是
 如果要全部采用objc_msgsend，实际上可以根据返回参数类型，downcast 10*4个，包括objc_msgsend,objc_msgsend_super,objc_msgsend_strect,objc_msgsend_fpret。
 优点是性能好，入参全部是id即可，不需要对入参downcast。缺点是需要对参数个数和返回类型downcast。
 
+#### Aspects
+
+传入一个block，根据这个block, 构造blockRef这样的结构体，从结构体里获取block的methodSignature。 然后根据sel，把初始的sel的IMP拷贝到另一个sel上。用_objc_msgForward这个消息转发的IMP替换这个sel的IMP。这样调用这个方法的时候就会走到_objc_msgForward。会转发到forwardInvocation:。
+然后hook这个类的forwardInvocation:方法。让这个类的forwardInvocation:调用自己的forwardInvocation:，同时把原先的IMP拷贝到另一个sel上。
+最后forwardInvocation:调用会调用到我们传入的block。
+
 ###### super的调用
 
-对于NSInvocation方式，采用类似JSPatch的手法，先获取到对象的父类，然后拿到IMP，拿到之后重命名selector，添加Method给子类，调用新的selector(指向父类的IMP)。
+对于NSInvocation方式，先获取到对象的父类，然后拿到IMP，拿到之后重命名selector，添加Method给子类，调用新的selector(指向父类的IMP)。
 
 #### block
 
-先定义一个模仿block的结构体，做到参数对齐，然后copy一下，返回这个block指针，这个block就可以被调用了。
+###### block对象的构造
+
+我们拿到一个OCBlockNode,包括这个block的methodSignature，和这个block的上下文。
+
+构造这个block的时候，主要需要block执行的IMP和methodSignature。我们定一个函数IMP作为wrapper送给block来构造这个block对象。这个函数IMP有block的入参作为参数，需要执行返回block的出参数。
+调用这个IMP，需要根据这个block的methodSignature,借助libffi定义
 
 block结构体(Block_layout)包括:
 - isa指针，NSConcreteStackBlock,NSConcreteMallocBlock等等
@@ -66,14 +77,38 @@ block结构体(Block_layout)包括:
 - invoke，就是IMP指针，指向的函数指针。 这个函数指针 返回void，有几个参数包括`void *ret, void **args, void *userdata`。
 - descriptor1, 包括flags和size
 - descriptor2, copy和dispose的函数指针，入参为block
-- descriptor3, 包括signature和layout本身
+- descriptor3, 包括signature
 
 signature就是类似methodSignature，定义了block的入参和出参类型。
 
+定义一个模仿block的结构体，做到参数对齐，然后copy一下，返回这个block对象，这个block就可以被调用了。
+
+###### block的调用
+
+调用block的时候，调用我们定义的函数IMP，有block的入参作为参数，需要执行返回block的出参数。
+我们就在这个IMP里获取到block定义里的Node(从block的代码块生成)。然后执行这个Node的excuteWithCtx:即可。
+
+还用一种情况是我们自己调用我们定义的block。这时只需要获取到这个block对象，然后执行NSInvocation的block的invoke即可。
+
+###### libffi的作用
+
+1. 准备一个函数实体
+2. 声明一个函数指针
+3. 根据函数参数个数/参数及返回值类型生成一个函数原型
+4. 创建一个ffi_closure对象，并用其将函数原型、函数实体、函数上下文、函数指针关联起来
+
+函数原型就是methodSignature
+函数实体就是我们调用的IMP，这是个通用函数实体，有四个参数(函数原型，返回指针，入参指针的指针，上下文数据)
+上下文数据就是调用者self这个对象，可以借助传入上下文参数
+函数指针其实是生成的函数指针，用来传给block定义并且构造block对象。
+
+libffi在这里实现了将不同类型的methodSignature传入，并且归一调用同一个block并且生成函数指针的能力。
+
+
 #### C函数
 
-由于Calling Convetion的原因，C函数的动态调用必须要借助libffi。原理类似objc_msgsend，需要用汇编处理栈和寄存器的出入参调用。
-对于入餐和出参的个数和类型的downcast，还是必须借助MethodSignatrue，所以自己编写一套类似MethodSignatrue的工具，包括把类型声明如int float转成 字符，然后再根据字符反转成类型。再包装成ffi_type。
+由于Calling Convetion的原因，C函数的动态调用也要借助libffi。原理类似objc_msgsend，需要用汇编处理栈和寄存器的出入参调用。
+对于入参和出参的个数和类型的downcast，还是必须借助MethodSignatrue，所以自己编写一套类似MethodSignatrue的工具，包括把类型声明如int float转成 字符，然后再根据字符反转成类型。再包装成ffi_type。
 根据ffi_type转换OC对象参数成C value，传入ffi_prep_cif_var，然后调用ffi_call。返回的时候把C的value转成OC 对象
 MethodSignatrue需要在我们使用C函数前自己定义。
 函数指针的获取通过dlopen/dlsym。但是无法上架。要用别的方式。
