@@ -3,6 +3,12 @@ layout: post
 title:  "完善的崩溃&日志框架"
 date:   2018-09-30 11:23:32
 ---
+# 差异化:来自三个方面
+
+- 网络层监控(相对于听云，网易APM等方案)
+- 卡顿监控(相对于QAPM)
+- 崩溃监控(相对于Bugly)
+- 子线程打印主线程堆栈(相对于MrPeak)
 
 # 开发
 
@@ -317,8 +323,9 @@ hook setNeedsLayout setNeedsDisplay 等方法，判断是否在主队列执行�
 # 卡顿监控
 
 卡顿监控需要三个参数一起使用，包括FPS，CPU占用率，主线程Runloop监控。如果CPU占用率超过80%，主线程Runloop卡顿超过2s, FPS明显降低则表示卡顿。子线程每秒检查一次主线程状态。
-微信团队认为FPS的意义不大。FPS抖动比较严重，因为基于CADisplayLink实现的 FPS 无法完全检测出当前 Core Animation 的性能情况，它只能检测出当前 RunLoop 的帧率。
+微信团队认为FPS的意义不大。FPS抖动比较严重，因为基于CADisplayLink实现的 FPS 无法检测出当前 Core Animation 的性能情况，它只能检测出当前 RunLoop 的帧率。
 还可以维护一个常驻线程去ping主线程。还可以通过hook objc_msgsend。损耗和精度成正比。
+这些方法都只能监控CPU卡顿(QAPM) 也是如此。 CPU的离屏渲染(CoreGraphics) 造成的可以监控。但是GPU的离屏渲染(圆角，阴影)无法监控。只能用Instruments监控。有一种方式比如引入SKView，但是本身就会引起卡顿。尤其是iOS9以上的时候。
 
 MrPeak选择ping主线程的方法(signal注册回调，pthread_kill暂停主线程)。因为认为在子线程Runloop的监控无法打印出主线程当前的堆栈。(调用callStackSymbols确实不行)
 但是我不赞同，因为pingpong对app执行的影响，pthread_kill的影响都很大，会影响线上app的正常运行。违背一个监控组件的基本原则。我使用Runloop的方式，并且把优先级降低。同时引入了BSBacktraceLogger来打印主线程当前的堆栈。这个组件利用task_threads来获取当前所有的mach thread，然后根据thread_id找到需要打印的thread，再利用mach内核的api比如thread_get_state来获取当前堆栈的地址，并利用Mach-O相关的api对地址进行符号化。
