@@ -1,0 +1,117 @@
+# NSInvocation
+### calling convention
+
+When calling a function, the first six parameters are passed by filling these registers in order: rdi, rsi, rdx, rcx, r8, and r9. Additional arguments, if any, are passed on the stack as 64-bit quantities, so subsequent parameters can be found in memory at rsp, rsp + 8, rsp + 16, etc.
+
+If the function returns a value, that value is returned by storing it in rax. If the function returns two values, such as when returning a struct like NSRange that contains two values, rdx is used for the second one. If the function returns a larger struct, this is handled by having the caller allocate enough memory to hold it, and then a pointer to that memory is passed as an implicit first argument to the function in rdi, with all of the explicit parameters moved down by one.
+
+Note that, for Objective-C methods, the first two parameters are self and \_cmd, which are therefore passed in rdi and rsi (or, if the method returns a larger struct, in rsi and rdx). The explicit parameters, if any, come after those two.
+
+定义结构体
+{
+  struct RawArguments
+    {
+        void \*fptr;  #函数指针
+        uint64_t rdi;
+        uint64_t rsi;
+        uint64_t rdx;
+        uint64_t rcx;
+        uint64_t r8;
+        uint64_t r9;  #64位传递参数的寄存器
+        uint64_t stackArgsCount; # 用栈传递的个数
+        uint64_t \*stackArgs; #  用栈参数的地址
+        uint64_t rax_ret;
+        uint64_t rdx_ret;
+        uint64_t isStretCall;
+};
+}
+
+pushq %rbp   #save the old frame pointer (stored in rbp) 把上一级的栈指针保存到栈上。
+movq %rsp, %rbp   #set up a new one by copying the stack pointer over   把新的栈指针从rsp给到rbp
+pushq %r12
+pushq %r13
+pushq %r14
+pushq %r15    #save their values onto the stack so they can be restored later.把寄存器上的先保存到栈上，调用完后再回复。
+mov %rdi, %r12  #The struct RawArguments * parameter is stored in rdi.first parameter to the function.save the current value into r12
+mov %rsp, %r15  #把栈指针拷贝到r15上。等会儿恢复。
+movq 56(%r12), %r10  #先操作栈的参数。加载栈参数的个数。struct Rawarguments 的offset56
+movq %r10, %r11   #已经有栈参数的个数了，需要*8得到栈空间。each argument is 64 bits, or 8 bytes。所以拷贝到r11上。
+shlq $3, %r11   #左移3位，就是*8
+movq 64(%r12), %r13  #把struct Rawarguments 的offset 64移动到r13上 (栈参数的指针)
+subq %r11, %rsp  #move the stack pointer down to make room for the arguments. r11是栈参数需要的字节数。
+andq $-0x10, %rsp  #函数调用前需要把栈16bytes对齐。 通过把栈的低4位清空。logical AND。
+
+接下来的逻辑类似，就是拷贝参数到栈上:
+for(int i = 0; i != r10; i++)
+    rsp[i] = r13[i];
+
+movq $0, %r14  #就是计数器i
+stackargs_loop:   #跳转的位置
+cmpq %r14, %r10   #对比r14和r10的值
+je done   #如果相等就跳转到done
+movq 0(%r13, %r14, 8), %rdi  #把r13对应的i的8bytes的值拷贝到rdi临时寄存器。  这个相当于解数组引用，相当于((uint64_t \*)r13)[r14].
+movq %rdi, 0(%rsp, %r14, 8)  #把rdi临时寄存器拷贝到rsp的i对应的8bytes。  
+inc %r14  #i++
+jmp stackargs_loop
+done:
+
+movq 8(%r12), %rdi   #栈参数处理完了。接下来处理寄存器参数比较容易。
+movq 16(%r12), %rsi
+movq 24(%r12), %rdx
+movq 32(%r12), %rcx
+movq 40(%r12), %r8
+movq 48(%r12), %r9
+callq \*(%r12)  #函数指针在最前面
+movq %rax, 72(%r12)  #把寄存器rax和rdx的拷贝到r12指向的 struct RawArguments结构体上。
+movq %rdx, 80(%r12)
+mov %r15, %rsp  #从r15恢复栈指针
+popq %r15  #从栈上恢复这些寄存器的原始的值
+popq %r14
+popq %r13
+popq %r12
+leave
+ret
+
+
+#### forward
+
+.globl _MAInvocationForward  #用r10来存储是否stret
+_MAInvocationForward:
+movq $0, %r10
+jmp _MAInvocationForwardCommon
+.globl _MAInvocationForwardStret
+_MAInvocationForwardStret:
+movq $1, %r10
+jmp _MAInvocationForwardCommon
+
+.globl _MAInvocationForwardCommon
+_MAInvocationForwardCommon:
+movq %rsp, %r11   #在r11上计算栈参数的位置。栈参数在rsp + 8。call函数 instruction issued by the caller pushes the return address onto the stack, 这里跟call不同，栈参数不在rsp上。
+addq $8, %r11    
+pushq %rbp     #把上一级的栈指针保存到栈上。跟call相同
+movq %rsp, %rbp
+pushq %r10  #construct the struct on the stack
+pushq $0  #make space for return value
+pushq $0
+pushq %r11  #stackArgs pointer, whose value is currently in r11
+pushq $0   the number of stack arguments
+pushq %r9  #寄存器参数
+pushq %r8
+pushq %rcx
+pushq %rdx
+pushq %rsi
+pushq %rdi
+pushq $0 #函数指针，这里没有使用，make room for it
+
+    #  rsp now contains a pointer to the newly-built struct RawArguments.
+
+movq %rsp, %rdi #The pointer to the struct is its only parameter, so that address needs to be moved to rdi, where the first parameter is passed:
+movq %rdi, %r12  #Since rdi isn't saved across the function call, and rsp may be changed when aligning the stack for the call
+andq $-0x10, %rsp  #align the stack
+callq _MAInvocationForwardC  #The Objective-C code will now construct an MAInvocation instance and invoke the object's forwardInvocation: method.
+movq 72(%r12), %rax
+movq 80(%r12), %rdx
+leave
+ret
+
+objc_setForwardHandler(MAInvocationForward, MAInvocationForwardStret);

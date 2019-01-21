@@ -73,6 +73,8 @@ struct weak_table_t {
 
 #### alloc new copy mutablecopy
 calloc() 函数相比于 malloc() 函数的优点是它将分配的内存区域初始化为0，相当于 malloc() 后再用 memset() 方法初始化一遍。
+NSObject对象初始化的时候，要根据@encode等方式，知道对象所需要占用的内存大小，成员变量的大小加起来。
+还有cxx_constructor 和 cxx_destructor。constructor不知道用来干啥，destructor用来释放strong对象
 
 在 retain 方法加符号断点会发现 alloc, new, copy, mutableCopy 这四个方法都会通过 Core Foundation 的 CFBasicHashAddValue() 函数来调用 retain 方法。
 

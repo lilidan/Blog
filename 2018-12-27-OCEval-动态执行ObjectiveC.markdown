@@ -30,6 +30,8 @@ NSString *viewDidLoad2 = @"{\
    implementation:viewDidLoad2];
 ```
 
+Theoretically we could make a whole application written by Objective-C and deliver it through the network. I had finished a simple ViewController in the iOS demo.
+
 
 OCEval甚至可以用来完整的编写一个页面或者App，并动态下发。我在iOS的Demo里实现了一个简单的页面，具体见源码。
 
