@@ -90,6 +90,10 @@ signature就是类似methodSignature，定义了block的入参和出参类型。
 
 还用一种情况是我们自己调用我们定义的block。这时只需要获取到这个block对象，然后执行NSInvocation的block的invoke即可。
 
+###### block的内存管理
+
+因为block内无法再捕获栈变量，而上下文都是堆变量。所以不用__block。
+
 ###### libffi的作用
 
 1. 准备一个函数实体
@@ -108,16 +112,34 @@ libffi在这里实现了将不同类型的methodSignature传入，并且归一�
 #### C函数
 
 由于Calling Convetion的原因，C函数的动态调用也要借助libffi。原理类似objc_msgsend，需要用汇编处理栈和寄存器的出入参调用。
-对于入参和出参的个数和类型的downcast，还是必须借助MethodSignatrue，所以自己编写一套类似MethodSignatrue的工具，包括把类型声明如int float转成 字符，然后再根据字符反转成类型。再包装成ffi_type。
-根据ffi_type转换OC对象参数成C value，传入ffi_prep_cif_var，然后调用ffi_call。返回的时候把C的value转成OC 对象
-MethodSignatrue需要在我们使用C函数前自己定义。
+对于入参和出参的个数和类型的downcast，还是必须借助MethodSignatrue，所以自己编写一套类似MethodSignatrue的工具，包括把类型声明如int float转成 字符(encode)，然后再根据字符反转成类型。再包装成ffi_type。
+
+C函数需要先手动定义其methodSignature。用全局的dictionary存储起来。
+
+入参根据methodSignature转换OC对象参数成C value，出参根据methodSignature把C value转换成OC对象。
+
+传入ffi_prep_cif_var，传入ffi_type来定义参数，然后调用ffi_call。
+
 函数指针的获取通过dlopen/dlsym。但是无法上架。要用别的方式。
 inline函数不好调用。
 转换的过程，NSNumber封装数据value，SEL和IMP还有结构体用NSValue封装。id类型对象用`__bridge`来封装指针。
 
-#### struct
+###### struct
 对于iOS中常用struct，直接用OC来封装。
-对于不常见的struct，一般是C函数调用，封装成ffi_type 对其.需要传入类型定义。
+对于不常见的struct，一般是C函数调用，封装成ffi_type。需要传入类型定义。
+在我们自己的MethodSignatrue的工具中，因为结构体encode之后是类似{}的，这里JSPatch处理得有问题，处理不了CGRect的情况。我重写了
+递归调用。
+
+###### C函数指针的获取
+
+搜索Mach-O。
+定一个search_image(bindings,mach_header,slide), 三个参数分别是我们传入的函数指针s和函数名称s封装的结构体。以及对应image的mach的header，和slide是在虚拟内存里的偏移。   
+
+因为Mach-O分为header，LC，sections三个部分
+
+然后在Load Command里找到各自load command，然后根据偏移找到symtab, strtab, indirect_symtab 三个表的offset。同时在data段的load command里找到la_symbol_ptr的section的地址和nl_symbol_ptr的section的地址。
+
+然后遍历这section，通过每一个指针的位置，在indirect_symtab找到symtab再找到strtab，在找到字符串，如果字符串相同则找到了这个函数指针(或者替换这个函数指针)
 
 #### 性能
 
@@ -126,3 +148,25 @@ inline函数不好调用。
 NSInvocation的调用跟Native速度差不多。关键慢在参数上下文传递。
 表达式比JSCore慢。
 比JSPatch快的原因是没有JS和OC的通信，没有参数转换(尤其是集合类型)。
+
+#### JSPatch的亮点
+
+- 调用block/C函数/结构体/super: OCEval已经实现。
+- 指针的指针:JSPatch封装了内存操作的C函数。 OCEval暂未实现。
+- weak/strong内存修饰符: 在block中使用，JSPatch利用JPBox封装weak对象。 OCEval暂未实现。
+- OC runtime的调用功能: 添加新方法，新增属性，新增协议。 OCEval暂未实现。
+- JSCore的优点:JS调试。
+- 内存管理:  利用JPBox封装weak/利用bridge_transfer移交内存管理权
+- nil: 创建全局变量[NSObject object] 作为nil传递过程中替代。当调用方法时再把nil替换回来。
+
+#### OCEval的亮点
+
+- 利用OC的特点:无需JS对象到OC对象的转换。可以提高性能，同时避免转换过程的类型问题，比如NSNumber，NSDictionary。
+- 内存管理:不再有栈变量，都是用上下文Dictionary保存。跟JSPatch都有延迟释放的问题，但是OCEval更可控(作用域结束的时候释放)。对于指针的指针，JSPatch封装内存操作C函数，OCEval需要重新给变量赋值。  因为都是堆变量，所以不需要__block。似乎也不需要__weak了？
+- C函数指针获取: 利用Mach-O
+- 细节处理: 比如struct的methodSignature递归，比如SEL和IMP作为参数的C函数调用。
+
+#### 解决方案&策略
+
+- 安全:对称加密(keaychain保存秘钥或下发不同的密钥)。HTTPS(SSL pinning+防代理)。 RSA+对称。
+- 执行:灰度发布。 crash监控。连续启动Crash后自动回退。下发命令JPCleaner及时撤回。
